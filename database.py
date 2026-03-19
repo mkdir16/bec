@@ -1,25 +1,28 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Берём URL из .env и меняем схему на синхронную
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+# Supabase даёт postgresql+asyncpg://... — заменяем на обычный postgresql://
+DATABASE_URL = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+DATABASE_URL = DATABASE_URL.replace("asyncpg://", "postgresql://")
 
-AsyncSessionLocal = sessionmaker(
-    engine, class_=AsyncSession, expire_on_commit=False
-)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 class Base(DeclarativeBase):
     pass
 
-# Dependency — используется в роутах FastAPI
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
+# Dependency для роутов FastAPI
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from sqlalchemy import select
 from pydantic import BaseModel
 from typing import Optional
@@ -15,46 +15,37 @@ from auth import verify_telegram_init_data
 
 app = FastAPI(title="Quiz App API")
 
-# CORS — разрешаем фронтенду обращаться к серверу
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В продакшене укажи конкретный домен
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Папка для загружаемых картинок
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 
-# ─── Запуск: создаём таблицы в БД ──────────────────────────────────────────
+# ── Создаём таблицы при старте ───────────────────────────────────────────
 
 @app.on_event("startup")
-async def startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+def startup():
+    Base.metadata.create_all(bind=engine)
     print("✅ База данных готова")
 
 
-# ─── Вспомогательная функция: получить текущего юзера ──────────────────────
+# ── Получить текущего юзера ──────────────────────────────────────────────
 
-async def get_current_user(
+def get_current_user(
     x_init_data: str = Header(..., alias="X-Init-Data"),
-    db: AsyncSession = Depends(get_db)
+    db: Session = Depends(get_db)
 ) -> User:
-    """
-    Фронтенд должен передавать заголовок X-Init-Data = window.Telegram.WebApp.initData
-    """
     tg_user = verify_telegram_init_data(x_init_data)
     if not tg_user:
         raise HTTPException(status_code=401, detail="Неверная подпись Telegram")
 
     tg_id = tg_user["id"]
-
-    # Ищем юзера в БД, если нет — создаём
-    result = await db.execute(select(User).where(User.tg_id == tg_id))
-    user = result.scalar_one_or_none()
+    user = db.query(User).filter(User.tg_id == tg_id).first()
 
     if not user:
         user = User(
@@ -63,77 +54,64 @@ async def get_current_user(
             is_admin=(str(tg_id) == os.getenv("ADMIN_TG_ID", "0"))
         )
         db.add(user)
-        await db.commit()
-        await db.refresh(user)
+        db.commit()
+        db.refresh(user)
 
     return user
 
 
-# ─── ПУБЛИЧНЫЕ РОУТЫ ────────────────────────────────────────────────────────
+# ── ПУБЛИЧНЫЕ РОУТЫ ──────────────────────────────────────────────────────
 
 @app.get("/")
-async def root():
+def root():
     return {"status": "Quiz API работает 🎉"}
 
 
 @app.get("/subjects")
-async def get_subjects(
-    db: AsyncSession = Depends(get_db),
+def get_subjects(
+    db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
-    """Получить список всех предметов"""
-    result = await db.execute(select(Subject))
-    subjects = result.scalars().all()
+    subjects = db.query(Subject).all()
     return [{"id": s.id, "title": s.title, "emoji": s.emoji} for s in subjects]
 
 
 @app.get("/questions/{subject_id}")
-async def get_questions(
+def get_questions(
     subject_id: int,
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
-    """Получить вопросы по предмету (без правильного ответа — его скрываем!)"""
-    result = await db.execute(
-        select(Question).where(Question.subject_id == subject_id)
-    )
-    questions = result.scalars().all()
-
+    questions = db.query(Question).filter(Question.subject_id == subject_id).all()
     output = []
     for q in questions:
-        opts_result = await db.execute(
-            select(Option)
-            .where(Option.question_id == q.id)
+        options = (
+            db.query(Option)
+            .filter(Option.question_id == q.id)
             .order_by(Option.order_index)
+            .all()
         )
-        options = opts_result.scalars().all()
         output.append({
             "id": q.id,
             "text": q.text,
             "image_url": q.image_url,
             "options": [{"id": o.id, "text": o.text} for o in options]
-            # НЕ возвращаем correct_option_id — студент не должен видеть!
         })
     return output
 
 
 class SubmitResultRequest(BaseModel):
     subject_id: int
-    answers: dict  # {question_id: chosen_option_index}
+    answers: dict
 
 
 @app.post("/results")
-async def submit_result(
+def submit_result(
     payload: SubmitResultRequest,
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
-    """Принять ответы студента, посчитать баллы и сохранить"""
-    # Загружаем вопросы
-    result = await db.execute(
-        select(Question).where(Question.subject_id == payload.subject_id)
-    )
-    questions = result.scalars().all()
+    questions = db.query(Question).filter(Question.subject_id == payload.subject_id).all()
 
     score = 0
     for q in questions:
@@ -141,7 +119,6 @@ async def submit_result(
         if chosen is not None and int(chosen) == q.correct_option_id:
             score += 1
 
-    # Сохраняем результат
     res = Result(
         user_id=user.id,
         subject_id=payload.subject_id,
@@ -149,7 +126,7 @@ async def submit_result(
         total=len(questions)
     )
     db.add(res)
-    await db.commit()
+    db.commit()
 
     return {
         "score": score,
@@ -158,7 +135,7 @@ async def submit_result(
     }
 
 
-# ─── АДМИНСКИЕ РОУТЫ ────────────────────────────────────────────────────────
+# ── АДМИНСКИЕ РОУТЫ ──────────────────────────────────────────────────────
 
 def require_admin(user: User = Depends(get_current_user)):
     if not user.is_admin:
@@ -167,37 +144,35 @@ def require_admin(user: User = Depends(get_current_user)):
 
 
 @app.post("/admin/subjects")
-async def create_subject(
+def create_subject(
     title: str,
     emoji: str = "📚",
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
     user: User = Depends(require_admin)
 ):
-    """Создать новый предмет"""
     subject = Subject(title=title, emoji=emoji)
     db.add(subject)
-    await db.commit()
-    await db.refresh(subject)
+    db.commit()
+    db.refresh(subject)
     return {"id": subject.id, "title": subject.title}
 
 
 class AddQuestionRequest(BaseModel):
     subject_id: int
     text: str
-    options: list[str]        # ["Вариант А", "Вариант Б", "Вариант В", "Вариант Г"]
-    correct_index: int         # 0, 1, 2 или 3
+    options: list[str]
+    correct_index: int
     image_url: Optional[str] = None
 
 
 @app.post("/admin/questions")
-async def add_question(
+def add_question(
     payload: AddQuestionRequest,
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
     user: User = Depends(require_admin)
 ):
-    """Добавить новый вопрос"""
     if len(payload.options) < 2:
-        raise HTTPException(status_code=400, detail="Нужно минимум 2 варианта ответа")
+        raise HTTPException(status_code=400, detail="Нужно минимум 2 варианта")
 
     q = Question(
         subject_id=payload.subject_id,
@@ -206,13 +181,12 @@ async def add_question(
         correct_option_id=payload.correct_index
     )
     db.add(q)
-    await db.flush()  # получаем q.id
+    db.flush()
 
     for i, opt_text in enumerate(payload.options):
-        opt = Option(question_id=q.id, text=opt_text, order_index=i)
-        db.add(opt)
+        db.add(Option(question_id=q.id, text=opt_text, order_index=i))
 
-    await db.commit()
+    db.commit()
     return {"id": q.id, "message": "Вопрос добавлен ✅"}
 
 
@@ -221,7 +195,6 @@ async def upload_image(
     file: UploadFile = File(...),
     user: User = Depends(require_admin)
 ):
-    """Загрузить картинку к вопросу"""
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Только картинки!")
 
@@ -237,18 +210,17 @@ async def upload_image(
 
 
 @app.get("/admin/results")
-async def get_all_results(
-    db: AsyncSession = Depends(get_db),
+def get_all_results(
+    db: Session = Depends(get_db),
     user: User = Depends(require_admin)
 ):
-    """Посмотреть результаты всех студентов"""
-    results = await db.execute(
-        select(Result, User, Subject)
+    rows = (
+        db.query(Result, User, Subject)
         .join(User, Result.user_id == User.id)
         .join(Subject, Result.subject_id == Subject.id)
         .order_by(Result.created_at.desc())
+        .all()
     )
-    rows = results.all()
     return [
         {
             "student": r.User.name,

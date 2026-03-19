@@ -7,7 +7,7 @@ import os
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("8797003440:AAGry4642kH6b1sO0IPaU0b_GTNHv6vLM7g")
 
 
 def verify_telegram_init_data(init_data: str) -> dict | None:

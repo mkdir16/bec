@@ -1,7 +1,4 @@
-from sqlalchemy import (
-    Column, Integer, String, Boolean,
-    ForeignKey, Text, DateTime, func
-)
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Text, DateTime, func
 from sqlalchemy.orm import relationship
 from database import Base
 
@@ -10,9 +7,9 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True)
-    tg_id = Column(Integer, unique=True, nullable=False, index=True)
-    name = Column(String(200))
-    phone = Column(String(20), nullable=True)
+    username = Column(String(100), unique=True, nullable=False, index=True)
+    password_hash = Column(String(200), nullable=False)
+    full_name = Column(String(200), nullable=True)
 
     # Роли: student / teacher / admin
     role = Column(String(20), default="student")
@@ -24,7 +21,6 @@ class User(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     results = relationship("Result", back_populates="user")
-    subscriptions = relationship("Subscription", back_populates="user")
 
 
 class Subject(Base):
@@ -72,20 +68,3 @@ class Result(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     user = relationship("User", back_populates="results")
-
-
-class Subscription(Base):
-    __tablename__ = "subscriptions"
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-
-    # Статус: pending / paid / cancelled
-    status = Column(String(20), default="pending")
-
-    amount = Column(Integer, default=20000)       # сум
-    payment_id = Column(String(200), nullable=True)  # ID из Payme
-    created_at = Column(DateTime, server_default=func.now())
-    paid_at = Column(DateTime, nullable=True)
-
-    user = relationship("User", back_populates="subscriptions")

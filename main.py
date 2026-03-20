@@ -1,21 +1,18 @@
-from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Request
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta
-import aiofiles
 import hashlib
-import hmac
-import json
-import base64
+import aiofiles
 import os
 import uuid
 
 from database import get_db, engine, Base
-from models import User, Subject, Question, Option, Result, Subscription
-from auth import verify_telegram_init_data
+from models import User, Subject, Question, Option, Result
+from auth import create_token, verify_token
 
 app = FastAPI(title="UniQuiz API")
 
@@ -29,10 +26,12 @@ app.add_middleware(
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-PAYME_MERCHANT_ID = os.getenv("PAYME_MERCHANT_ID", "")
-PAYME_SECRET_KEY = os.getenv("PAYME_SECRET_KEY", "")
-SUBSCRIPTION_PRICE = 20000  # сум
+SUBSCRIPTION_PRICE = 20000
 SUBSCRIPTION_DAYS = 30
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
 
 
 # ── Старт ────────────────────────────────────────────────────────────────
@@ -40,43 +39,48 @@ SUBSCRIPTION_DAYS = 30
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
+
+    # Создаём админа если его нет
+    db = next(get_db())
+    admin = db.query(User).filter(User.username == "admin").first()
+    if not admin:
+        admin = User(
+            username="admin",
+            password_hash=hash_password("admin123"),
+            full_name="Администратор",
+            role="admin",
+            subscription_active=True
+        )
+        db.add(admin)
+        db.commit()
+        print("✅ Админ создан: login=admin, password=admin123")
     print("✅ База данных готова")
 
 
-# ── Получить текущего юзера ──────────────────────────────────────────────
+# ── Авторизация ──────────────────────────────────────────────────────────
 
 def get_current_user(
-    x_init_data: str = Header(..., alias="X-Init-Data"),
+    authorization: str = Header(..., alias="Authorization"),
     db: Session = Depends(get_db)
 ) -> User:
-    tg_user = verify_telegram_init_data(x_init_data)
-    if not tg_user:
-        raise HTTPException(status_code=401, detail="Неверная подпись Telegram")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Неверный формат токена")
 
-    tg_id = tg_user["id"]
-    user = db.query(User).filter(User.tg_id == tg_id).first()
+    token = authorization[7:]
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Токен недействителен или истёк")
 
+    user = db.query(User).filter(User.id == int(payload["sub"])).first()
     if not user:
-        # Новый юзер — определяем роль
-        admin_id = os.getenv("ADMIN_TG_ID", "0")
-        role = "admin" if str(tg_id) == admin_id else "student"
+        raise HTTPException(status_code=401, detail="Пользователь не найден")
 
-        user = User(
-            tg_id=tg_id,
-            name=tg_user.get("first_name", ""),
-            role=role,
-            subscription_active=(role in ["admin", "teacher"])
-        )
-        db.add(user)
+    # Проверяем подписку
+    if (user.subscription_expires and
+            user.subscription_expires < datetime.utcnow() and
+            user.role == "student"):
+        user.subscription_active = False
         db.commit()
-        db.refresh(user)
-    else:
-        # Проверяем не истекла ли подписка
-        if (user.subscription_expires and
-                user.subscription_expires < datetime.utcnow() and
-                user.role == "student"):
-            user.subscription_active = False
-            db.commit()
 
     return user
 
@@ -94,7 +98,6 @@ def require_admin(user: User = Depends(get_current_user)):
 
 
 def require_subscription(user: User = Depends(get_current_user)):
-    """Проверяет что у студента есть активная подписка"""
     if user.role in ["admin", "teacher"]:
         return user
     if not user.subscription_active:
@@ -102,7 +105,7 @@ def require_subscription(user: User = Depends(get_current_user)):
     return user
 
 
-# ── ПУБЛИЧНЫЕ РОУТЫ ──────────────────────────────────────────────────────
+# ── ВХОД / РЕГИСТРАЦИЯ ───────────────────────────────────────────────────
 
 @app.get("/")
 @app.head("/")
@@ -110,18 +113,46 @@ def root():
     return {"status": "UniQuiz API 🎉"}
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/login")
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == payload.username).first()
+
+    if not user or user.password_hash != hash_password(payload.password):
+        raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+
+    token = create_token(user.id, user.role)
+
+    return {
+        "token": token,
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "full_name": user.full_name,
+            "role": user.role,
+            "subscription_active": user.subscription_active,
+            "subscription_expires": user.subscription_expires.isoformat() if user.subscription_expires else None,
+        }
+    }
+
+
 @app.get("/me")
 def get_me(user: User = Depends(get_current_user)):
-    """Получить данные текущего юзера — вызывается при старте приложения"""
     return {
         "id": user.id,
-        "tg_id": user.tg_id,
-        "name": user.name,
+        "username": user.username,
+        "full_name": user.full_name,
         "role": user.role,
         "subscription_active": user.subscription_active,
         "subscription_expires": user.subscription_expires.isoformat() if user.subscription_expires else None,
     }
 
+
+# ── ПРЕДМЕТЫ И ВОПРОСЫ ───────────────────────────────────────────────────
 
 @app.get("/subjects")
 def get_subjects(
@@ -136,7 +167,7 @@ def get_subjects(
 def get_questions(
     subject_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(require_subscription)   # ← требует подписку
+    user: User = Depends(require_subscription)
 ):
     questions = db.query(Question).filter(Question.subject_id == subject_id).all()
     output = []
@@ -196,7 +227,6 @@ def my_results(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
-    """История результатов текущего студента"""
     results = (
         db.query(Result, Subject)
         .join(Subject, Result.subject_id == Subject.id)
@@ -217,111 +247,7 @@ def my_results(
     ]
 
 
-# ── ОПЛАТА PAYME ─────────────────────────────────────────────────────────
-
-@app.post("/payment/create")
-def create_payment(
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user)
-):
-    """Создать запись об оплате и вернуть ссылку на Payme"""
-    if user.subscription_active and user.subscription_expires and \
-       user.subscription_expires > datetime.utcnow():
-        return {"message": "Подписка уже активна", "expires": user.subscription_expires.isoformat()}
-
-    # Создаём запись подписки
-    sub = Subscription(user_id=user.id, status="pending", amount=SUBSCRIPTION_PRICE)
-    db.add(sub)
-    db.commit()
-    db.refresh(sub)
-
-    # Формируем ссылку на Payme
-    # Параметры: merchant_id, amount (в тийинах = сум * 100), order_id
-    amount_tiyin = SUBSCRIPTION_PRICE * 100
-    params = f"m={PAYME_MERCHANT_ID};ac.order_id={sub.id};a={amount_tiyin}"
-    encoded = base64.b64encode(params.encode()).decode()
-    payme_url = f"https://checkout.paycom.uz/{encoded}"
-
-    return {
-        "payment_id": sub.id,
-        "amount": SUBSCRIPTION_PRICE,
-        "payme_url": payme_url
-    }
-
-
-@app.post("/payment/payme-webhook")
-async def payme_webhook(request: Request, db: Session = Depends(get_db)):
-    """
-    Webhook от Payme — вызывается когда студент оплатил.
-    Payme отправляет JSON-RPC запросы на этот URL.
-    """
-    body = await request.json()
-    method = body.get("method")
-    params = body.get("params", {})
-
-    # Проверяем авторизацию от Payme
-    auth = request.headers.get("Authorization", "")
-    if auth:
-        try:
-            decoded = base64.b64decode(auth.split(" ")[1]).decode()
-            _, key = decoded.split(":")
-            if key != PAYME_SECRET_KEY:
-                return {"error": {"code": -32504, "message": "Forbidden"}}
-        except Exception:
-            pass
-
-    if method == "CheckPerformTransaction":
-        order_id = params.get("account", {}).get("order_id")
-        sub = db.query(Subscription).filter(Subscription.id == order_id).first()
-        if not sub:
-            return {"result": {"allow": False}}
-        return {"result": {"allow": True}}
-
-    elif method == "CreateTransaction":
-        order_id = params.get("account", {}).get("order_id")
-        sub = db.query(Subscription).filter(Subscription.id == order_id).first()
-        if not sub:
-            return {"error": {"code": -31050, "message": "Order not found"}}
-        return {"result": {"create_time": int(datetime.utcnow().timestamp() * 1000), "transaction": str(sub.id), "state": 1}}
-
-    elif method == "PerformTransaction":
-        order_id = params.get("account", {}).get("order_id")
-        sub = db.query(Subscription).filter(Subscription.id == order_id).first()
-        if not sub:
-            return {"error": {"code": -31050, "message": "Order not found"}}
-
-        # Активируем подписку!
-        sub.status = "paid"
-        sub.paid_at = datetime.utcnow()
-
-        user = db.query(User).filter(User.id == sub.user_id).first()
-        if user:
-            user.subscription_active = True
-            user.subscription_expires = datetime.utcnow() + timedelta(days=SUBSCRIPTION_DAYS)
-
-        db.commit()
-        return {"result": {"transaction": str(sub.id), "perform_time": int(datetime.utcnow().timestamp() * 1000), "state": 2}}
-
-    elif method == "CancelTransaction":
-        order_id = params.get("account", {}).get("order_id")
-        sub = db.query(Subscription).filter(Subscription.id == order_id).first()
-        if sub:
-            sub.status = "cancelled"
-            db.commit()
-        return {"result": {"transaction": str(sub.id) if sub else "0", "cancel_time": int(datetime.utcnow().timestamp() * 1000), "state": -1}}
-
-    elif method == "CheckTransaction":
-        order_id = params.get("account", {}).get("order_id")
-        sub = db.query(Subscription).filter(Subscription.id == order_id).first()
-        if not sub:
-            return {"error": {"code": -31003, "message": "Transaction not found"}}
-        state = 2 if sub.status == "paid" else (-1 if sub.status == "cancelled" else 1)
-        return {"result": {"create_time": int(sub.created_at.timestamp() * 1000), "perform_time": int(sub.paid_at.timestamp() * 1000) if sub.paid_at else 0, "cancel_time": 0, "transaction": str(sub.id), "state": state, "reason": None}}
-
-    return {"result": None}
-
-
-# ── ПРЕПОДАВАТЕЛЬ / АДМИН РОУТЫ ──────────────────────────────────────────
+# ── АДМИН: ПРЕДМЕТЫ ──────────────────────────────────────────────────────
 
 @app.post("/admin/subjects")
 def create_subject(
@@ -336,6 +262,8 @@ def create_subject(
     db.refresh(subject)
     return {"id": subject.id, "title": subject.title}
 
+
+# ── АДМИН: ВОПРОСЫ ───────────────────────────────────────────────────────
 
 class AddQuestionRequest(BaseModel):
     subject_id: int
@@ -403,8 +331,8 @@ def get_all_results(
     )
     return [
         {
-            "student": r.User.name,
-            "tg_id": r.User.tg_id,
+            "student": r.User.full_name or r.User.username,
+            "username": r.User.username,
             "subject": r.Subject.title,
             "score": r.Result.score,
             "total": r.Result.total,
@@ -414,18 +342,19 @@ def get_all_results(
     ]
 
 
+# ── АДМИН: ПОЛЬЗОВАТЕЛИ ──────────────────────────────────────────────────
+
 @app.get("/admin/users")
 def get_all_users(
     db: Session = Depends(get_db),
     user: User = Depends(require_admin)
 ):
-    """Список всех пользователей (только для админа)"""
     users = db.query(User).order_by(User.created_at.desc()).all()
     return [
         {
             "id": u.id,
-            "tg_id": u.tg_id,
-            "name": u.name,
+            "username": u.username,
+            "full_name": u.full_name,
             "role": u.role,
             "subscription_active": u.subscription_active,
             "subscription_expires": u.subscription_expires.isoformat() if u.subscription_expires else None,
@@ -434,18 +363,103 @@ def get_all_users(
     ]
 
 
+class CreateUserRequest(BaseModel):
+    username: str
+    password: str
+    full_name: Optional[str] = None
+    role: str = "student"
+
+
+@app.post("/admin/users")
+def create_user(
+    payload: CreateUserRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin)
+):
+    existing = db.query(User).filter(User.username == payload.username).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Такой логин уже существует")
+
+    if payload.role not in ["student", "teacher", "admin"]:
+        raise HTTPException(status_code=400, detail="Роль должна быть: student, teacher, admin")
+
+    new_user = User(
+        username=payload.username,
+        password_hash=hash_password(payload.password),
+        full_name=payload.full_name,
+        role=payload.role,
+        subscription_active=(payload.role in ["admin", "teacher"])
+    )
+    db.add(new_user)
+    db.commit()
+    return {"message": f"Пользователь {payload.username} создан ✅"}
+
+
+class UpdatePasswordRequest(BaseModel):
+    user_id: int
+    new_password: str
+
+
+@app.post("/admin/users/password")
+def update_password(
+    payload: UpdatePasswordRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin)
+):
+    target = db.query(User).filter(User.id == payload.user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+    target.password_hash = hash_password(payload.new_password)
+    db.commit()
+    return {"message": "Пароль обновлён ✅"}
+
+
+@app.delete("/admin/users/{user_id}")
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin)
+):
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    if target.username == "admin":
+        raise HTTPException(status_code=400, detail="Нельзя удалить главного админа")
+
+    db.delete(target)
+    db.commit()
+    return {"message": "Пользователь удалён ✅"}
+
+
+@app.post("/admin/activate-subscription")
+def activate_subscription(
+    user_id: int,
+    days: int = 30,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin)
+):
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+    target.subscription_active = True
+    target.subscription_expires = datetime.utcnow() + timedelta(days=days)
+    db.commit()
+    return {"message": f"Подписка активирована на {days} дней ✅"}
+
+
 @app.post("/admin/set-role")
 def set_role(
-    tg_id: int,
+    user_id: int,
     role: str,
     db: Session = Depends(get_db),
     user: User = Depends(require_admin)
 ):
-    """Назначить роль пользователю (admin/teacher/student)"""
     if role not in ["admin", "teacher", "student"]:
-        raise HTTPException(status_code=400, detail="Роль должна быть: admin, teacher, student")
+        raise HTTPException(status_code=400, detail="Роль: admin, teacher, student")
 
-    target = db.query(User).filter(User.tg_id == tg_id).first()
+    target = db.query(User).filter(User.id == user_id).first()
     if not target:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
 
@@ -454,21 +468,3 @@ def set_role(
         target.subscription_active = True
     db.commit()
     return {"message": f"Роль {role} назначена ✅"}
-
-
-@app.post("/admin/activate-subscription")
-def activate_subscription(
-    tg_id: int,
-    days: int = 30,
-    db: Session = Depends(get_db),
-    user: User = Depends(require_admin)
-):
-    """Вручную активировать подписку студенту"""
-    target = db.query(User).filter(User.tg_id == tg_id).first()
-    if not target:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
-
-    target.subscription_active = True
-    target.subscription_expires = datetime.utcnow() + timedelta(days=days)
-    db.commit()
-    return {"message": f"Подписка активирована на {days} дней ✅"}

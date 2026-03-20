@@ -105,6 +105,7 @@ def require_subscription(user: User = Depends(get_current_user)):
 # ── ПУБЛИЧНЫЕ РОУТЫ ──────────────────────────────────────────────────────
 
 @app.get("/")
+@app.head("/")
 def root():
     return {"status": "UniQuiz API 🎉"}
 

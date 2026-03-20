@@ -1,55 +1,28 @@
-import hashlib
-import hmac
-import json
-from urllib.parse import parse_qs, unquote
-from dotenv import load_dotenv
+from datetime import datetime, timedelta
+from typing import Optional
+import jwt
 import os
+from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+SECRET_KEY = os.getenv("SECRET_KEY", "uniquiz-secret-key-2024")
+ALGORITHM = "HS256"
+TOKEN_EXPIRE_DAYS = 30
 
 
-def verify_telegram_init_data(init_data: str) -> dict | None:
-    """
-    Проверяет подпись initData от Telegram.
-    Возвращает dict с данными юзера или None если подпись неверна.
-    """
+def create_token(user_id: int, role: str) -> str:
+    payload = {
+        "sub": str(user_id),
+        "role": role,
+        "exp": datetime.utcnow() + timedelta(days=TOKEN_EXPIRE_DAYS)
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
-    # ── Тестовый режим (для проверки в браузере) ──────────────────────────
-    if init_data == "test":
-        admin_id = int(os.getenv("ADMIN_TG_ID", "0"))
-        return {"id": admin_id, "first_name": "Test Admin"}
 
+def verify_token(token: str) -> Optional[dict]:
     try:
-        parsed = parse_qs(init_data)
-
-        received_hash = parsed.get("hash", [None])[0]
-        if not received_hash:
-            return None
-
-        data_check_parts = []
-        for key, values in sorted(parsed.items()):
-            if key != "hash":
-                data_check_parts.append(f"{key}={values[0]}")
-
-        data_check_string = "\n".join(data_check_parts)
-
-        secret_key = hmac.new(
-            b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256
-        ).digest()
-
-        calculated_hash = hmac.new(
-            secret_key, data_check_string.encode(), hashlib.sha256
-        ).hexdigest()
-
-        if not hmac.compare_digest(calculated_hash, received_hash):
-            return None
-
-        user_json = unquote(parsed.get("user", ["{}"])[0])
-        user_data = json.loads(user_json)
-
-        return user_data
-
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
     except Exception:
         return None

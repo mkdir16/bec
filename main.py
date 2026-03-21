@@ -173,7 +173,7 @@ def get_me(user: User = Depends(get_current_user)):
 
 @app.get("/subjects")
 def get_subjects(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return [{"id": s.id, "title": s.title, "emoji": s.emoji} for s in db.query(Subject).all()]
+    return [{"id": s.id, "title": s.title, "emoji": s.emoji, "time_limit": s.time_limit} for s in db.query(Subject).all()]
 
 
 @app.get("/questions/{subject_id}")
@@ -213,10 +213,10 @@ def my_results(db: Session = Depends(get_db), user: User = Depends(get_current_u
 # ── АДМИН: ПРЕДМЕТЫ ──────────────────────────────────────────────────────
 
 @app.post("/admin/subjects")
-def create_subject(title: str, emoji: str = "📚", db: Session = Depends(get_db), user: User = Depends(require_teacher)):
-    s = Subject(title=title, emoji=emoji)
+def create_subject(title: str, emoji: str = "📚", time_limit: int = 60, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
+    s = Subject(title=title, emoji=emoji, time_limit=time_limit)
     db.add(s); db.commit(); db.refresh(s)
-    return {"id": s.id, "title": s.title}
+    return {"id": s.id, "title": s.title, "time_limit": s.time_limit}
 
 
 # ── АДМИН: ВОПРОСЫ ───────────────────────────────────────────────────────
@@ -249,6 +249,105 @@ async def upload_image(file: UploadFile = File(...), user: User = Depends(requir
     async with aiofiles.open(f"uploads/{filename}", "wb") as f:
         f.write(await file.read())
     return {"image_url": f"/uploads/{filename}"}
+
+
+@app.post("/admin/import-questions")
+async def import_questions(
+    subject_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_teacher)
+):
+    """Импорт вопросов из Excel файла"""
+    import openpyxl
+    import tempfile
+
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="Только Excel файлы (.xlsx)")
+
+    subject = db.query(Subject).filter(Subject.id == subject_id).first()
+    if not subject:
+        raise HTTPException(status_code=404, detail="Предмет не найден")
+
+    # Сохраняем файл временно
+    content = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        wb = openpyxl.load_workbook(tmp_path)
+        ws = wb.active
+
+        letter_to_index = {"A": 0, "Б": 1, "В": 2, "Г": 3, "Д": 4}
+        added = 0
+        errors = []
+
+        for row_num, row in enumerate(ws.iter_rows(min_row=6, values_only=True), start=6):
+            # Пропускаем пустые строки
+            if not row[0]:
+                continue
+
+            q_text = str(row[0]).strip() if row[0] else ""
+            opt_a = str(row[1]).strip() if row[1] else ""
+            opt_b = str(row[2]).strip() if row[2] else ""
+            opt_c = str(row[3]).strip() if row[3] else ""
+            opt_d = str(row[4]).strip() if row[4] else ""
+            opt_e = str(row[5]).strip() if row[5] else ""
+            correct_letter = str(row[6]).strip().upper() if row[6] else ""
+
+            # Проверяем обязательные поля
+            if not q_text:
+                errors.append(f"Строка {row_num}: пустой вопрос")
+                continue
+            if not opt_a or not opt_b:
+                errors.append(f"Строка {row_num}: нужно минимум 2 варианта (A и Б)")
+                continue
+            if correct_letter not in letter_to_index:
+                errors.append(f"Строка {row_num}: неверный правильный ответ '{correct_letter}' (нужно A/Б/В/Г/Д)")
+                continue
+
+            # Собираем варианты
+            options = [opt_a, opt_b]
+            if opt_c: options.append(opt_c)
+            if opt_d: options.append(opt_d)
+            if opt_e: options.append(opt_e)
+
+            correct_index = letter_to_index[correct_letter]
+            if correct_index >= len(options):
+                errors.append(f"Строка {row_num}: правильный ответ '{correct_letter}' — варианта нет")
+                continue
+
+            # Добавляем вопрос
+            q = Question(
+                subject_id=subject_id,
+                text=q_text,
+                correct_option_id=correct_index
+            )
+            db.add(q)
+            db.flush()
+
+            for i, opt_text in enumerate(options):
+                db.add(Option(question_id=q.id, text=opt_text, order_index=i))
+
+            added += 1
+
+        db.commit()
+
+        result = {"added": added, "errors": errors[:10]}  # максимум 10 ошибок
+        if errors:
+            result["message"] = f"Добавлено {added} вопросов, пропущено {len(errors)} строк с ошибками"
+        else:
+            result["message"] = f"Успешно добавлено {added} вопросов ✅"
+
+        return result
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Ошибка чтения файла: {str(e)}")
+    finally:
+        import os as _os
+        _os.unlink(tmp_path)
 
 
 @app.get("/admin/results")

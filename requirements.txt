@@ -7,3 +7,4 @@ python-multipart>=0.0.12
 aiofiles>=24.1.0
 httpx>=0.28.0
 PyJWT>=2.8.0
+openpyxl>=3.1.0

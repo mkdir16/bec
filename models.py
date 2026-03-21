@@ -10,13 +10,11 @@ class User(Base):
     username = Column(String(100), unique=True, nullable=False, index=True)
     password_hash = Column(String(200), nullable=False)
     full_name = Column(String(200), nullable=True)
-
-    # Роли: student / teacher / admin
     role = Column(String(20), default="student")
 
-    # Подписка
     subscription_active = Column(Boolean, default=False)
     subscription_expires = Column(DateTime, nullable=True)
+    is_trial = Column(Boolean, default=False)  # True = на пробном периоде
 
     created_at = Column(DateTime, server_default=func.now())
 

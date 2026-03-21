@@ -16,72 +16,44 @@ from auth import create_token, verify_token
 
 app = FastAPI(title="UniQuiz API")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-SUBSCRIPTION_PRICE = 20000
 SUBSCRIPTION_DAYS = 30
+FREE_TRIAL_DAYS = 3
 
 
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+def hash_password(p: str) -> str:
+    return hashlib.sha256(p.encode()).hexdigest()
 
-
-# ── Старт ────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
-
-    # Создаём админа если его нет
     db = next(get_db())
     admin = db.query(User).filter(User.username == "admin").first()
     if not admin:
-        admin = User(
-            username="admin",
-            password_hash=hash_password("admin123"),
-            full_name="Администратор",
-            role="admin",
-            subscription_active=True
-        )
-        db.add(admin)
+        db.add(User(username="admin", password_hash=hash_password("admin123"), full_name="Администратор", role="admin", subscription_active=True, is_trial=False))
         db.commit()
-        print("✅ Админ создан: login=admin, password=admin123")
+        print("✅ Админ создан: admin / admin123")
     print("✅ База данных готова")
 
 
-# ── Авторизация ──────────────────────────────────────────────────────────
-
-def get_current_user(
-    authorization: str = Header(..., alias="Authorization"),
-    db: Session = Depends(get_db)
-) -> User:
+def get_current_user(authorization: str = Header(..., alias="Authorization"), db: Session = Depends(get_db)) -> User:
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Неверный формат токена")
-
-    token = authorization[7:]
-    payload = verify_token(token)
+    payload = verify_token(authorization[7:])
     if not payload:
-        raise HTTPException(status_code=401, detail="Токен недействителен или истёк")
-
+        raise HTTPException(status_code=401, detail="Токен недействителен")
     user = db.query(User).filter(User.id == int(payload["sub"])).first()
     if not user:
         raise HTTPException(status_code=401, detail="Пользователь не найден")
-
-    # Проверяем подписку
-    if (user.subscription_expires and
-            user.subscription_expires < datetime.utcnow() and
-            user.role == "student"):
+    # Проверяем истечение подписки
+    if user.subscription_expires and user.subscription_expires < datetime.utcnow() and user.role == "student":
         user.subscription_active = False
         db.commit()
-
     return user
 
 
@@ -105,7 +77,22 @@ def require_subscription(user: User = Depends(get_current_user)):
     return user
 
 
-# ── ВХОД / РЕГИСТРАЦИЯ ───────────────────────────────────────────────────
+def user_to_dict(user: User) -> dict:
+    days_left = None
+    if user.subscription_expires and user.role == "student":
+        delta = user.subscription_expires - datetime.utcnow()
+        days_left = max(0, delta.days)
+    return {
+        "id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+        "role": user.role,
+        "subscription_active": user.subscription_active,
+        "subscription_expires": user.subscription_expires.isoformat() if user.subscription_expires else None,
+        "days_left": days_left,
+        "is_trial": user.is_trial,
+    }
+
 
 @app.get("/")
 @app.head("/")
@@ -121,67 +108,30 @@ class LoginRequest(BaseModel):
 @app.post("/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == payload.username).first()
-
     if not user or user.password_hash != hash_password(payload.password):
         raise HTTPException(status_code=401, detail="Неверный логин или пароль")
-
-    token = create_token(user.id, user.role)
-
-    return {
-        "token": token,
-        "user": {
-            "id": user.id,
-            "username": user.username,
-            "full_name": user.full_name,
-            "role": user.role,
-            "subscription_active": user.subscription_active,
-            "subscription_expires": user.subscription_expires.isoformat() if user.subscription_expires else None,
-        }
-    }
+    return {"token": create_token(user.id, user.role), "user": user_to_dict(user)}
 
 
 @app.get("/me")
 def get_me(user: User = Depends(get_current_user)):
-    return {
-        "id": user.id,
-        "username": user.username,
-        "full_name": user.full_name,
-        "role": user.role,
-        "subscription_active": user.subscription_active,
-        "subscription_expires": user.subscription_expires.isoformat() if user.subscription_expires else None,
-    }
+    return user_to_dict(user)
 
-
-# ── ПРЕДМЕТЫ И ВОПРОСЫ ───────────────────────────────────────────────────
 
 @app.get("/subjects")
-def get_subjects(
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user)
-):
-    subjects = db.query(Subject).all()
-    return [{"id": s.id, "title": s.title, "emoji": s.emoji} for s in subjects]
+def get_subjects(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return [{"id": s.id, "title": s.title, "emoji": s.emoji} for s in db.query(Subject).all()]
 
 
 @app.get("/questions/{subject_id}")
-def get_questions(
-    subject_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(require_subscription)
-):
+def get_questions(subject_id: int, db: Session = Depends(get_db), user: User = Depends(require_subscription)):
     questions = db.query(Question).filter(Question.subject_id == subject_id).all()
     output = []
     for q in questions:
-        options = (
-            db.query(Option)
-            .filter(Option.question_id == q.id)
-            .order_by(Option.order_index)
-            .all()
-        )
+        options = db.query(Option).filter(Option.question_id == q.id).order_by(Option.order_index).all()
         output.append({
-            "id": q.id,
-            "text": q.text,
-            "image_url": q.image_url,
+            "id": q.id, "text": q.text, "image_url": q.image_url,
+            "correct_option_id": q.correct_option_id,
             "options": [{"id": o.id, "text": o.text} for o in options]
         })
     return output
@@ -193,77 +143,26 @@ class SubmitResultRequest(BaseModel):
 
 
 @app.post("/results")
-def submit_result(
-    payload: SubmitResultRequest,
-    db: Session = Depends(get_db),
-    user: User = Depends(require_subscription)
-):
+def submit_result(payload: SubmitResultRequest, db: Session = Depends(get_db), user: User = Depends(require_subscription)):
     questions = db.query(Question).filter(Question.subject_id == payload.subject_id).all()
-
-    score = 0
-    for q in questions:
-        chosen = payload.answers.get(str(q.id))
-        if chosen is not None and int(chosen) == q.correct_option_id:
-            score += 1
-
-    res = Result(
-        user_id=user.id,
-        subject_id=payload.subject_id,
-        score=score,
-        total=len(questions)
-    )
-    db.add(res)
+    score = sum(1 for q in questions if payload.answers.get(str(q.id)) is not None and int(payload.answers[str(q.id)]) == q.correct_option_id)
+    db.add(Result(user_id=user.id, subject_id=payload.subject_id, score=score, total=len(questions)))
     db.commit()
-
-    return {
-        "score": score,
-        "total": len(questions),
-        "percentage": round(score / len(questions) * 100) if questions else 0
-    }
+    return {"score": score, "total": len(questions), "percentage": round(score / len(questions) * 100) if questions else 0}
 
 
 @app.get("/my-results")
-def my_results(
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user)
-):
-    results = (
-        db.query(Result, Subject)
-        .join(Subject, Result.subject_id == Subject.id)
-        .filter(Result.user_id == user.id)
-        .order_by(Result.created_at.desc())
-        .all()
-    )
-    return [
-        {
-            "subject": r.Subject.title,
-            "emoji": r.Subject.emoji,
-            "score": r.Result.score,
-            "total": r.Result.total,
-            "percentage": round(r.Result.score / r.Result.total * 100) if r.Result.total else 0,
-            "date": r.Result.created_at.isoformat() if r.Result.created_at else None
-        }
-        for r in results
-    ]
+def my_results(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    rows = db.query(Result, Subject).join(Subject, Result.subject_id == Subject.id).filter(Result.user_id == user.id).order_by(Result.created_at.desc()).all()
+    return [{"subject": r.Subject.title, "emoji": r.Subject.emoji, "score": r.Result.score, "total": r.Result.total, "percentage": round(r.Result.score / r.Result.total * 100) if r.Result.total else 0, "date": r.Result.created_at.isoformat() if r.Result.created_at else None} for r in rows]
 
-
-# ── АДМИН: ПРЕДМЕТЫ ──────────────────────────────────────────────────────
 
 @app.post("/admin/subjects")
-def create_subject(
-    title: str,
-    emoji: str = "📚",
-    db: Session = Depends(get_db),
-    user: User = Depends(require_teacher)
-):
-    subject = Subject(title=title, emoji=emoji)
-    db.add(subject)
-    db.commit()
-    db.refresh(subject)
-    return {"id": subject.id, "title": subject.title}
+def create_subject(title: str, emoji: str = "📚", db: Session = Depends(get_db), user: User = Depends(require_teacher)):
+    s = Subject(title=title, emoji=emoji)
+    db.add(s); db.commit(); db.refresh(s)
+    return {"id": s.id, "title": s.title}
 
-
-# ── АДМИН: ВОПРОСЫ ───────────────────────────────────────────────────────
 
 class AddQuestionRequest(BaseModel):
     subject_id: int
@@ -274,93 +173,43 @@ class AddQuestionRequest(BaseModel):
 
 
 @app.post("/admin/questions")
-def add_question(
-    payload: AddQuestionRequest,
-    db: Session = Depends(get_db),
-    user: User = Depends(require_teacher)
-):
+def add_question(payload: AddQuestionRequest, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
     if len(payload.options) < 2:
         raise HTTPException(status_code=400, detail="Нужно минимум 2 варианта")
-
-    q = Question(
-        subject_id=payload.subject_id,
-        text=payload.text,
-        image_url=payload.image_url,
-        correct_option_id=payload.correct_index
-    )
-    db.add(q)
-    db.flush()
-
-    for i, opt_text in enumerate(payload.options):
-        db.add(Option(question_id=q.id, text=opt_text, order_index=i))
-
+    q = Question(subject_id=payload.subject_id, text=payload.text, image_url=payload.image_url, correct_option_id=payload.correct_index)
+    db.add(q); db.flush()
+    for i, t in enumerate(payload.options):
+        db.add(Option(question_id=q.id, text=t, order_index=i))
     db.commit()
     return {"id": q.id, "message": "Вопрос добавлен ✅"}
 
 
 @app.post("/admin/upload-image")
-async def upload_image(
-    file: UploadFile = File(...),
-    user: User = Depends(require_teacher)
-):
+async def upload_image(file: UploadFile = File(...), user: User = Depends(require_teacher)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Только картинки!")
-
-    ext = file.filename.split(".")[-1]
-    filename = f"{uuid.uuid4()}.{ext}"
-    path = f"uploads/{filename}"
-
-    async with aiofiles.open(path, "wb") as f:
-        content = await file.read()
-        await f.write(content)
-
+    filename = f"{uuid.uuid4()}.{file.filename.split('.')[-1]}"
+    async with aiofiles.open(f"uploads/{filename}", "wb") as f:
+        f.write(await file.read())
     return {"image_url": f"/uploads/{filename}"}
 
 
 @app.get("/admin/results")
-def get_all_results(
-    db: Session = Depends(get_db),
-    user: User = Depends(require_teacher)
-):
-    rows = (
-        db.query(Result, User, Subject)
-        .join(User, Result.user_id == User.id)
-        .join(Subject, Result.subject_id == Subject.id)
-        .order_by(Result.created_at.desc())
-        .all()
-    )
-    return [
-        {
-            "student": r.User.full_name or r.User.username,
-            "username": r.User.username,
-            "subject": r.Subject.title,
-            "score": r.Result.score,
-            "total": r.Result.total,
-            "date": r.Result.created_at.isoformat() if r.Result.created_at else None
-        }
-        for r in rows
-    ]
+def get_all_results(db: Session = Depends(get_db), user: User = Depends(require_teacher)):
+    rows = db.query(Result, User, Subject).join(User, Result.user_id == User.id).join(Subject, Result.subject_id == Subject.id).order_by(Result.created_at.desc()).all()
+    return [{"student": r.User.full_name or r.User.username, "username": r.User.username, "subject": r.Subject.title, "score": r.Result.score, "total": r.Result.total, "date": r.Result.created_at.isoformat() if r.Result.created_at else None} for r in rows]
 
-
-# ── АДМИН: ПОЛЬЗОВАТЕЛИ ──────────────────────────────────────────────────
 
 @app.get("/admin/users")
-def get_all_users(
-    db: Session = Depends(get_db),
-    user: User = Depends(require_admin)
-):
+def get_all_users(db: Session = Depends(get_db), user: User = Depends(require_admin)):
     users = db.query(User).order_by(User.created_at.desc()).all()
-    return [
-        {
-            "id": u.id,
-            "username": u.username,
-            "full_name": u.full_name,
-            "role": u.role,
-            "subscription_active": u.subscription_active,
-            "subscription_expires": u.subscription_expires.isoformat() if u.subscription_expires else None,
-        }
-        for u in users
-    ]
+    return [{
+        "id": u.id, "username": u.username, "full_name": u.full_name,
+        "role": u.role, "subscription_active": u.subscription_active,
+        "subscription_expires": u.subscription_expires.isoformat() if u.subscription_expires else None,
+        "is_trial": u.is_trial,
+        "created_at": u.created_at.isoformat() if u.created_at else None,
+    } for u in users]
 
 
 class CreateUserRequest(BaseModel):
@@ -371,100 +220,63 @@ class CreateUserRequest(BaseModel):
 
 
 @app.post("/admin/users")
-def create_user(
-    payload: CreateUserRequest,
-    db: Session = Depends(get_db),
-    user: User = Depends(require_admin)
-):
-    existing = db.query(User).filter(User.username == payload.username).first()
-    if existing:
+def create_user(payload: CreateUserRequest, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+    if db.query(User).filter(User.username == payload.username).first():
         raise HTTPException(status_code=400, detail="Такой логин уже существует")
-
     if payload.role not in ["student", "teacher", "admin"]:
-        raise HTTPException(status_code=400, detail="Роль должна быть: student, teacher, admin")
+        raise HTTPException(status_code=400, detail="Роль: student, teacher, admin")
 
+    is_student = payload.role == "student"
     new_user = User(
         username=payload.username,
         password_hash=hash_password(payload.password),
         full_name=payload.full_name,
         role=payload.role,
-        subscription_active=(payload.role in ["admin", "teacher"])
+        subscription_active=True,
+        # Студентам — 3 дня бесплатно, остальным — безлимит
+        subscription_expires=datetime.utcnow() + timedelta(days=FREE_TRIAL_DAYS) if is_student else None,
+        is_trial=is_student
     )
-    db.add(new_user)
-    db.commit()
-    return {"message": f"Пользователь {payload.username} создан ✅"}
-
-
-class UpdatePasswordRequest(BaseModel):
-    user_id: int
-    new_password: str
-
-
-@app.post("/admin/users/password")
-def update_password(
-    payload: UpdatePasswordRequest,
-    db: Session = Depends(get_db),
-    user: User = Depends(require_admin)
-):
-    target = db.query(User).filter(User.id == payload.user_id).first()
-    if not target:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
-
-    target.password_hash = hash_password(payload.new_password)
-    db.commit()
-    return {"message": "Пароль обновлён ✅"}
+    db.add(new_user); db.commit()
+    msg = f"Пользователь {payload.username} создан ✅"
+    if is_student:
+        msg += f" (пробный период {FREE_TRIAL_DAYS} дня)"
+    return {"message": msg}
 
 
 @app.delete("/admin/users/{user_id}")
-def delete_user(
-    user_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(require_admin)
-):
+def delete_user(user_id: int, db: Session = Depends(get_db), user: User = Depends(require_admin)):
     target = db.query(User).filter(User.id == user_id).first()
     if not target:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
+        raise HTTPException(status_code=404, detail="Не найден")
     if target.username == "admin":
         raise HTTPException(status_code=400, detail="Нельзя удалить главного админа")
-
-    db.delete(target)
-    db.commit()
-    return {"message": "Пользователь удалён ✅"}
+    db.delete(target); db.commit()
+    return {"message": "Удалён ✅"}
 
 
 @app.post("/admin/activate-subscription")
-def activate_subscription(
-    user_id: int,
-    days: int = 30,
-    db: Session = Depends(get_db),
-    user: User = Depends(require_admin)
-):
+def activate_subscription(user_id: int, days: int = 30, db: Session = Depends(get_db), user: User = Depends(require_admin)):
     target = db.query(User).filter(User.id == user_id).first()
     if not target:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
-
+        raise HTTPException(status_code=404, detail="Не найден")
     target.subscription_active = True
     target.subscription_expires = datetime.utcnow() + timedelta(days=days)
+    target.is_trial = False  # снимаем триал — человек заплатил
     db.commit()
     return {"message": f"Подписка активирована на {days} дней ✅"}
 
 
 @app.post("/admin/set-role")
-def set_role(
-    user_id: int,
-    role: str,
-    db: Session = Depends(get_db),
-    user: User = Depends(require_admin)
-):
+def set_role(user_id: int, role: str, db: Session = Depends(get_db), user: User = Depends(require_admin)):
     if role not in ["admin", "teacher", "student"]:
         raise HTTPException(status_code=400, detail="Роль: admin, teacher, student")
-
     target = db.query(User).filter(User.id == user_id).first()
     if not target:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
-
+        raise HTTPException(status_code=404, detail="Не найден")
     target.role = role
     if role in ["admin", "teacher"]:
         target.subscription_active = True
+        target.is_trial = False
     db.commit()
     return {"message": f"Роль {role} назначена ✅"}

@@ -35,13 +35,23 @@ def startup():
     db = next(get_db())
     admin = db.query(User).filter(User.username == "admin").first()
     if not admin:
-        db.add(User(username="admin", password_hash=hash_password("admin123"), full_name="Администратор", role="admin", subscription_active=True, is_trial=False))
+        db.add(User(
+            username="admin",
+            password_hash=hash_password("admin123"),
+            full_name="Администратор",
+            role="admin",
+            subscription_active=True,
+            is_trial=False
+        ))
         db.commit()
         print("✅ Админ создан: admin / admin123")
     print("✅ База данных готова")
 
 
-def get_current_user(authorization: str = Header(..., alias="Authorization"), db: Session = Depends(get_db)) -> User:
+def get_current_user(
+    authorization: str = Header(..., alias="Authorization"),
+    db: Session = Depends(get_db)
+) -> User:
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Неверный формат токена")
     payload = verify_token(authorization[7:])
@@ -50,7 +60,6 @@ def get_current_user(authorization: str = Header(..., alias="Authorization"), db
     user = db.query(User).filter(User.id == int(payload["sub"])).first()
     if not user:
         raise HTTPException(status_code=401, detail="Пользователь не найден")
-    # Проверяем истечение подписки
     if user.subscription_expires and user.subscription_expires < datetime.utcnow() and user.role == "student":
         user.subscription_active = False
         db.commit()
@@ -94,6 +103,8 @@ def user_to_dict(user: User) -> dict:
     }
 
 
+# ── ПУБЛИЧНЫЕ РОУТЫ ──────────────────────────────────────────────────────
+
 @app.get("/")
 @app.head("/")
 def root():
@@ -113,10 +124,52 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     return {"token": create_token(user.id, user.role), "user": user_to_dict(user)}
 
 
+class RegisterRequest(BaseModel):
+    full_name: str        # Имя студента
+    username: str         # Придуманный логин
+    password: str         # Пароль
+
+
+@app.post("/register")
+def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+    """Самостоятельная регистрация студента — получает 3 дня бесплатно"""
+
+    # Проверяем что логин не занят
+    if db.query(User).filter(User.username == payload.username).first():
+        raise HTTPException(status_code=400, detail="Этот логин уже занят, придумай другой")
+
+    # Проверяем минимальную длину
+    if len(payload.username) < 3:
+        raise HTTPException(status_code=400, detail="Логин должен быть минимум 3 символа")
+    if len(payload.password) < 4:
+        raise HTTPException(status_code=400, detail="Пароль должен быть минимум 4 символа")
+    if len(payload.full_name.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Введи своё имя")
+
+    # Создаём студента с триалом
+    new_user = User(
+        username=payload.username.lower().strip(),
+        password_hash=hash_password(payload.password),
+        full_name=payload.full_name.strip(),
+        role="student",
+        subscription_active=True,
+        subscription_expires=datetime.utcnow() + timedelta(days=FREE_TRIAL_DAYS),
+        is_trial=True
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    token = create_token(new_user.id, new_user.role)
+    return {"token": token, "user": user_to_dict(new_user)}
+
+
 @app.get("/me")
 def get_me(user: User = Depends(get_current_user)):
     return user_to_dict(user)
 
+
+# ── ПРЕДМЕТЫ И ВОПРОСЫ ───────────────────────────────────────────────────
 
 @app.get("/subjects")
 def get_subjects(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
@@ -157,12 +210,16 @@ def my_results(db: Session = Depends(get_db), user: User = Depends(get_current_u
     return [{"subject": r.Subject.title, "emoji": r.Subject.emoji, "score": r.Result.score, "total": r.Result.total, "percentage": round(r.Result.score / r.Result.total * 100) if r.Result.total else 0, "date": r.Result.created_at.isoformat() if r.Result.created_at else None} for r in rows]
 
 
+# ── АДМИН: ПРЕДМЕТЫ ──────────────────────────────────────────────────────
+
 @app.post("/admin/subjects")
 def create_subject(title: str, emoji: str = "📚", db: Session = Depends(get_db), user: User = Depends(require_teacher)):
     s = Subject(title=title, emoji=emoji)
     db.add(s); db.commit(); db.refresh(s)
     return {"id": s.id, "title": s.title}
 
+
+# ── АДМИН: ВОПРОСЫ ───────────────────────────────────────────────────────
 
 class AddQuestionRequest(BaseModel):
     subject_id: int
@@ -200,6 +257,8 @@ def get_all_results(db: Session = Depends(get_db), user: User = Depends(require_
     return [{"student": r.User.full_name or r.User.username, "username": r.User.username, "subject": r.Subject.title, "score": r.Result.score, "total": r.Result.total, "date": r.Result.created_at.isoformat() if r.Result.created_at else None} for r in rows]
 
 
+# ── АДМИН: ПОЛЬЗОВАТЕЛИ ──────────────────────────────────────────────────
+
 @app.get("/admin/users")
 def get_all_users(db: Session = Depends(get_db), user: User = Depends(require_admin)):
     users = db.query(User).order_by(User.created_at.desc()).all()
@@ -225,7 +284,6 @@ def create_user(payload: CreateUserRequest, db: Session = Depends(get_db), user:
         raise HTTPException(status_code=400, detail="Такой логин уже существует")
     if payload.role not in ["student", "teacher", "admin"]:
         raise HTTPException(status_code=400, detail="Роль: student, teacher, admin")
-
     is_student = payload.role == "student"
     new_user = User(
         username=payload.username,
@@ -233,15 +291,11 @@ def create_user(payload: CreateUserRequest, db: Session = Depends(get_db), user:
         full_name=payload.full_name,
         role=payload.role,
         subscription_active=True,
-        # Студентам — 3 дня бесплатно, остальным — безлимит
         subscription_expires=datetime.utcnow() + timedelta(days=FREE_TRIAL_DAYS) if is_student else None,
         is_trial=is_student
     )
     db.add(new_user); db.commit()
-    msg = f"Пользователь {payload.username} создан ✅"
-    if is_student:
-        msg += f" (пробный период {FREE_TRIAL_DAYS} дня)"
-    return {"message": msg}
+    return {"message": f"Пользователь {payload.username} создан ✅"}
 
 
 @app.delete("/admin/users/{user_id}")
@@ -262,7 +316,7 @@ def activate_subscription(user_id: int, days: int = 30, db: Session = Depends(ge
         raise HTTPException(status_code=404, detail="Не найден")
     target.subscription_active = True
     target.subscription_expires = datetime.utcnow() + timedelta(days=days)
-    target.is_trial = False  # снимаем триал — человек заплатил
+    target.is_trial = False
     db.commit()
     return {"message": f"Подписка активирована на {days} дней ✅"}
 

@@ -27,6 +27,7 @@ class Subject(Base):
     id = Column(Integer, primary_key=True)
     title = Column(String(200), nullable=False)
     emoji = Column(String(10), default="📚")
+    time_limit = Column(Integer, default=60)  # минуты на весь тест
 
     questions = relationship("Question", back_populates="subject")
 

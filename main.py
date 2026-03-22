@@ -208,6 +208,21 @@ def get_questions(
     return output
 
 
+@app.get("/questions-all/{subject_id}")
+def get_all_questions_student(subject_id: int, db: Session = Depends(get_db), user: User = Depends(require_subscription)):
+    """Все вопросы с правильными ответами — для базы знаний студента"""
+    questions = db.query(Question).filter(Question.subject_id == subject_id).all()
+    output = []
+    for q in questions:
+        options = db.query(Option).filter(Option.question_id == q.id).order_by(Option.order_index).all()
+        output.append({
+            "id": q.id, "text": q.text, "image_url": q.image_url,
+            "correct_option_id": q.correct_option_id,
+            "options": [{"id": o.id, "text": o.text} for o in options]
+        })
+    return output
+
+
 @app.get("/knowledge/{subject_id}")
 def get_knowledge(
     subject_id: int,

@@ -14,11 +14,12 @@ class User(Base):
 
     subscription_active = Column(Boolean, default=False)
     subscription_expires = Column(DateTime, nullable=True)
-    is_trial = Column(Boolean, default=False)  # True = на пробном периоде
+    is_trial = Column(Boolean, default=False)
 
     created_at = Column(DateTime, server_default=func.now())
 
     results = relationship("Result", back_populates="user")
+    achievements = relationship("UserAchievement", back_populates="user")
 
 
 class Subject(Base):
@@ -27,8 +28,8 @@ class Subject(Base):
     id = Column(Integer, primary_key=True)
     title = Column(String(200), nullable=False)
     emoji = Column(String(10), default="📚")
-    time_limit = Column(Integer, default=60)      # минуты на тест
-    question_count = Column(Integer, default=30)  # сколько вопросов брать из базы
+    time_limit = Column(Integer, default=60)
+    question_count = Column(Integer, default=30)
 
     questions = relationship("Question", back_populates="subject")
 
@@ -68,3 +69,34 @@ class Result(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     user = relationship("User", back_populates="results")
+
+
+class UserAchievement(Base):
+    """Достижения пользователей"""
+    __tablename__ = "user_achievements"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    achievement_id = Column(String(50), nullable=False)  # first_test, streak_3, perfect etc
+    earned_at = Column(DateTime, server_default=func.now())
+
+    user = relationship("User", back_populates="achievements")
+
+
+class Duel(Base):
+    """Дуэли между студентами"""
+    __tablename__ = "duels"
+
+    id = Column(Integer, primary_key=True)
+    subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=False)
+    challenger_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    opponent_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    status = Column(String(20), default="waiting")  # waiting, active, finished
+    question_ids = Column(Text, nullable=True)  # JSON список ID вопросов
+    challenger_score = Column(Integer, default=0)
+    opponent_score = Column(Integer, default=0)
+    challenger_finished = Column(Boolean, default=False)
+    opponent_finished = Column(Boolean, default=False)
+    winner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    code = Column(String(8), unique=True, nullable=True)  # код для присоединения

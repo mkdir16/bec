@@ -173,12 +173,27 @@ def get_me(user: User = Depends(get_current_user)):
 
 @app.get("/subjects")
 def get_subjects(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return [{"id": s.id, "title": s.title, "emoji": s.emoji, "time_limit": s.time_limit} for s in db.query(Subject).all()]
+    subjects = db.query(Subject).all()
+    result = []
+    for s in subjects:
+        total = db.query(Question).filter(Question.subject_id == s.id).count()
+        result.append({"id": s.id, "title": s.title, "emoji": s.emoji, "time_limit": s.time_limit, "question_count": s.question_count or 30, "total_questions": total})
+    return result
 
 
 @app.get("/questions/{subject_id}")
-def get_questions(subject_id: int, db: Session = Depends(get_db), user: User = Depends(require_subscription)):
+def get_questions(
+    subject_id: int,
+    limit: int = 30,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscription)
+):
+    import random
     questions = db.query(Question).filter(Question.subject_id == subject_id).all()
+    # Берём случайные limit вопросов
+    if len(questions) > limit:
+        questions = random.sample(questions, limit)
+
     output = []
     for q in questions:
         options = db.query(Option).filter(Option.question_id == q.id).order_by(Option.order_index).all()
@@ -188,6 +203,34 @@ def get_questions(subject_id: int, db: Session = Depends(get_db), user: User = D
             "options": [{"id": o.id, "text": o.text} for o in options]
         })
     return output
+
+
+@app.get("/knowledge/{subject_id}")
+def get_knowledge(
+    subject_id: int,
+    page: int = 1,
+    per_page: int = 50,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    """Вся база вопросов с правильными ответами — для изучения"""
+    total = db.query(Question).filter(Question.subject_id == subject_id).count()
+    questions = (
+        db.query(Question)
+        .filter(Question.subject_id == subject_id)
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+    output = []
+    for q in questions:
+        options = db.query(Option).filter(Option.question_id == q.id).order_by(Option.order_index).all()
+        output.append({
+            "id": q.id, "text": q.text,
+            "correct_option_id": q.correct_option_id,
+            "options": [{"id": o.id, "text": o.text} for o in options]
+        })
+    return {"total": total, "page": page, "per_page": per_page, "questions": output}
 
 
 class SubmitResultRequest(BaseModel):
@@ -213,10 +256,10 @@ def my_results(db: Session = Depends(get_db), user: User = Depends(get_current_u
 # ── АДМИН: ПРЕДМЕТЫ ──────────────────────────────────────────────────────
 
 @app.post("/admin/subjects")
-def create_subject(title: str, emoji: str = "📚", time_limit: int = 60, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
-    s = Subject(title=title, emoji=emoji, time_limit=time_limit)
+def create_subject(title: str, emoji: str = "📚", time_limit: int = 60, question_count: int = 30, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
+    s = Subject(title=title, emoji=emoji, time_limit=time_limit, question_count=question_count)
     db.add(s); db.commit(); db.refresh(s)
-    return {"id": s.id, "title": s.title, "time_limit": s.time_limit}
+    return {"id": s.id, "title": s.title, "time_limit": s.time_limit, "question_count": s.question_count}
 
 
 # ── АДМИН: ВОПРОСЫ ───────────────────────────────────────────────────────

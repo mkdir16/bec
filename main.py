@@ -9,9 +9,12 @@ import hashlib
 import aiofiles
 import os
 import uuid
+import json
+import random
+import string
 
 from database import get_db, engine, Base
-from models import User, Subject, Question, Option, Result
+from models import User, Subject, Question, Option, Result, UserAchievement, Duel
 from auth import create_token, verify_token
 
 app = FastAPI(title="UniQuiz API")
@@ -244,7 +247,16 @@ def submit_result(payload: SubmitResultRequest, db: Session = Depends(get_db), u
     score = sum(1 for q in questions if payload.answers.get(str(q.id)) is not None and int(payload.answers[str(q.id)]) == q.correct_option_id)
     db.add(Result(user_id=user.id, subject_id=payload.subject_id, score=score, total=len(questions)))
     db.commit()
-    return {"score": score, "total": len(questions), "percentage": round(score / len(questions) * 100) if questions else 0}
+
+    # Проверяем достижения
+    new_achievements = check_and_award(user.id, db)
+
+    return {
+        "score": score,
+        "total": len(questions),
+        "percentage": round(score / len(questions) * 100) if questions else 0,
+        "new_achievements": new_achievements
+    }
 
 
 @app.get("/my-results")
@@ -462,6 +474,189 @@ def activate_subscription(user_id: int, days: int = 30, db: Session = Depends(ge
     db.commit()
     return {"message": f"Подписка активирована на {days} дней ✅"}
 
+
+
+
+# ── ДОСТИЖЕНИЯ ────────────────────────────────────────────────────────────
+
+ACHIEVEMENTS = {
+    "first_test":   {"id": "first_test",   "title": "Первый шаг",    "desc": "Сдал первый тест",             "emoji": "🎯"},
+    "perfect":      {"id": "perfect",      "title": "Отличник",      "desc": "100% правильных ответов",      "emoji": "💯"},
+    "streak_3":     {"id": "streak_3",     "title": "На волне",      "desc": "3 теста подряд выше 80%",      "emoji": "🔥"},
+    "speed_run":    {"id": "speed_run",    "title": "Молния",        "desc": "Закончил тест за 50% времени", "emoji": "⚡"},
+    "all_subjects": {"id": "all_subjects", "title": "Всезнайка",     "desc": "Прошёл все предметы",          "emoji": "🏆"},
+    "duel_win":     {"id": "duel_win",     "title": "Победитель",    "desc": "Выиграл дуэль",                "emoji": "⚔️"},
+    "duel_3":       {"id": "duel_3",       "title": "Дуэлянт",       "desc": "Выиграл 3 дуэли",              "emoji": "🥊"},
+}
+
+
+@app.get("/my-achievements")
+def get_my_achievements(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    earned = db.query(UserAchievement).filter(UserAchievement.user_id == user.id).all()
+    earned_ids = {a.achievement_id for a in earned}
+    result = []
+    for ach_id, ach in ACHIEVEMENTS.items():
+        result.append({**ach, "earned": ach_id in earned_ids,
+                       "earned_at": next((a.earned_at.isoformat() for a in earned if a.achievement_id == ach_id), None)})
+    return result
+
+
+def check_and_award(user_id: int, db: Session, extra: dict = {}):
+    """Проверяем и выдаём достижения после теста"""
+    results = db.query(Result).filter(Result.user_id == user_id).all()
+    earned = {a.achievement_id for a in db.query(UserAchievement).filter(UserAchievement.user_id == user_id).all()}
+    new_achievements = []
+
+    def award(ach_id):
+        if ach_id not in earned:
+            db.add(UserAchievement(user_id=user_id, achievement_id=ach_id))
+            new_achievements.append(ACHIEVEMENTS[ach_id])
+            earned.add(ach_id)
+
+    if len(results) >= 1: award("first_test")
+
+    last = results[-1] if results else None
+    if last and last.total > 0 and last.score == last.total: award("perfect")
+
+    if extra.get("speed_bonus"): award("speed_run")
+
+    if len(results) >= 3:
+        last3 = sorted(results, key=lambda r: r.created_at)[-3:]
+        if all(r.total > 0 and r.score / r.total >= 0.8 for r in last3):
+            award("streak_3")
+
+    subjects_done = {r.subject_id for r in results}
+    total_subjects = db.query(Subject).count()
+    if total_subjects > 0 and len(subjects_done) >= total_subjects:
+        award("all_subjects")
+
+    duel_wins = db.query(Duel).filter(Duel.winner_id == user_id).count()
+    if duel_wins >= 1: award("duel_win")
+    if duel_wins >= 3: award("duel_3")
+
+    db.commit()
+    return new_achievements
+
+
+# ── ДУЭЛИ ─────────────────────────────────────────────────────────────────
+
+def gen_code():
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
+
+@app.post("/duel/create")
+def create_duel(subject_id: int, db: Session = Depends(get_db), user: User = Depends(require_subscription)):
+    import random as rnd
+    questions = db.query(Question).filter(Question.subject_id == subject_id).all()
+    if len(questions) < 10:
+        raise HTTPException(status_code=400, detail="Нужно минимум 10 вопросов в предмете")
+    selected = rnd.sample(questions, min(10, len(questions)))
+    code = gen_code()
+    while db.query(Duel).filter(Duel.code == code).first():
+        code = gen_code()
+    duel = Duel(
+        subject_id=subject_id,
+        challenger_id=user.id,
+        status="waiting",
+        question_ids=json.dumps([q.id for q in selected]),
+        code=code
+    )
+    db.add(duel); db.commit(); db.refresh(duel)
+    return {"duel_id": duel.id, "code": code, "subject_id": subject_id}
+
+
+@app.post("/duel/join/{code}")
+def join_duel(code: str, db: Session = Depends(get_db), user: User = Depends(require_subscription)):
+    duel = db.query(Duel).filter(Duel.code == code.upper(), Duel.status == "waiting").first()
+    if not duel:
+        raise HTTPException(status_code=404, detail="Дуэль не найдена или уже началась")
+    if duel.challenger_id == user.id:
+        raise HTTPException(status_code=400, detail="Нельзя присоединиться к своей дуэли")
+    duel.opponent_id = user.id
+    duel.status = "active"
+    db.commit()
+    return {"duel_id": duel.id, "subject_id": duel.subject_id}
+
+
+@app.get("/duel/{duel_id}/questions")
+def get_duel_questions(duel_id: int, db: Session = Depends(get_db), user: User = Depends(require_subscription)):
+    duel = db.query(Duel).filter(Duel.id == duel_id).first()
+    if not duel:
+        raise HTTPException(status_code=404, detail="Дуэль не найдена")
+    if user.id not in [duel.challenger_id, duel.opponent_id]:
+        raise HTTPException(status_code=403, detail="Ты не участник этой дуэли")
+    q_ids = json.loads(duel.question_ids)
+    questions = db.query(Question).filter(Question.id.in_(q_ids)).all()
+    output = []
+    for q in questions:
+        options = db.query(Option).filter(Option.question_id == q.id).order_by(Option.order_index).all()
+        output.append({"id": q.id, "text": q.text, "image_url": q.image_url,
+                       "correct_option_id": q.correct_option_id,
+                       "options": [{"id": o.id, "text": o.text} for o in options]})
+    return output
+
+
+@app.post("/duel/{duel_id}/submit")
+def submit_duel(duel_id: int, answers: dict, db: Session = Depends(get_db), user: User = Depends(require_subscription)):
+    duel = db.query(Duel).filter(Duel.id == duel_id).first()
+    if not duel or duel.status != "active":
+        raise HTTPException(status_code=400, detail="Дуэль не активна")
+    is_challenger = user.id == duel.challenger_id
+    if not is_challenger and user.id != duel.opponent_id:
+        raise HTTPException(status_code=403, detail="Ты не участник")
+
+    q_ids = json.loads(duel.question_ids)
+    questions = db.query(Question).filter(Question.id.in_(q_ids)).all()
+    score = sum(1 for q in questions if answers.get(str(q.id)) is not None and int(answers[str(q.id)]) == q.correct_option_id)
+
+    if is_challenger:
+        duel.challenger_score = score
+        duel.challenger_finished = True
+    else:
+        duel.opponent_score = score
+        duel.opponent_finished = True
+
+    # Если оба закончили — определяем победителя
+    if duel.challenger_finished and duel.opponent_finished:
+        duel.status = "finished"
+        if duel.challenger_score > duel.opponent_score:
+            duel.winner_id = duel.challenger_id
+        elif duel.opponent_score > duel.challenger_score:
+            duel.winner_id = duel.opponent_id
+        # При ничьей winner_id остаётся None
+        check_and_award(duel.challenger_id, db)
+        check_and_award(duel.opponent_id, db)
+
+    db.commit()
+    return {"score": score, "total": len(questions), "finished": duel.challenger_finished and duel.opponent_finished,
+            "duel_status": duel.status}
+
+
+@app.get("/duel/{duel_id}/status")
+def duel_status(duel_id: int, db: Session = Depends(get_db), user: User = Depends(require_subscription)):
+    duel = db.query(Duel).filter(Duel.id == duel_id).first()
+    if not duel:
+        raise HTTPException(status_code=404, detail="Не найдена")
+    is_challenger = user.id == duel.challenger_id
+    my_score = duel.challenger_score if is_challenger else duel.opponent_score
+    opp_score = duel.opponent_score if is_challenger else duel.challenger_score
+    opp_finished = duel.opponent_finished if is_challenger else duel.challenger_finished
+
+    # Берём данные соперника
+    opp_id = duel.opponent_id if is_challenger else duel.challenger_id
+    opp = db.query(User).filter(User.id == opp_id).first() if opp_id else None
+
+    return {
+        "status": duel.status,
+        "my_score": my_score,
+        "opp_score": opp_score,
+        "opp_name": (opp.full_name or opp.username) if opp else None,
+        "opp_finished": opp_finished,
+        "winner_id": duel.winner_id,
+        "i_won": duel.winner_id == user.id,
+        "draw": duel.status == "finished" and duel.winner_id is None,
+        "code": duel.code
+    }
 
 @app.post("/admin/set-role")
 def set_role(user_id: int, role: str, db: Session = Depends(get_db), user: User = Depends(require_admin)):

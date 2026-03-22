@@ -27,7 +27,8 @@ class Subject(Base):
     id = Column(Integer, primary_key=True)
     title = Column(String(200), nullable=False)
     emoji = Column(String(10), default="📚")
-    time_limit = Column(Integer, default=60)  # минуты на весь тест
+    time_limit = Column(Integer, default=60)      # минуты на тест
+    question_count = Column(Integer, default=30)  # сколько вопросов брать из базы
 
     questions = relationship("Question", back_populates="subject")
 
@@ -50,7 +51,7 @@ class Option(Base):
 
     id = Column(Integer, primary_key=True)
     question_id = Column(Integer, ForeignKey("questions.id"), nullable=False)
-    text = Column(String(500), nullable=False)
+    text = Column(String(2000), nullable=False)
     order_index = Column(Integer, default=0)
 
     question = relationship("Question", back_populates="options")

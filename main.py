@@ -203,7 +203,7 @@ def get_questions(
         output.append({
             "id": q.id, "text": q.text, "image_url": q.image_url,
             "correct_option_id": q.correct_option_id,
-            "options": [{"id": o.id, "text": o.text} for o in options]
+            "options": [{"id": o.id, "text": o.text, "image_url": o.image_url} for o in options]
         })
     return output
 
@@ -218,7 +218,7 @@ def get_all_questions_student(subject_id: int, db: Session = Depends(get_db), us
         output.append({
             "id": q.id, "text": q.text, "image_url": q.image_url,
             "correct_option_id": q.correct_option_id,
-            "options": [{"id": o.id, "text": o.text} for o in options]
+            "options": [{"id": o.id, "text": o.text, "image_url": o.image_url} for o in options]
         })
     return output
 
@@ -246,7 +246,7 @@ def get_knowledge(
         output.append({
             "id": q.id, "text": q.text,
             "correct_option_id": q.correct_option_id,
-            "options": [{"id": o.id, "text": o.text} for o in options]
+            "options": [{"id": o.id, "text": o.text, "image_url": o.image_url} for o in options]
         })
     return {"total": total, "page": page, "per_page": per_page, "questions": output}
 
@@ -291,12 +291,16 @@ def create_subject(title: str, emoji: str = "📚", time_limit: int = 60, questi
 
 # ── АДМИН: ВОПРОСЫ ───────────────────────────────────────────────────────
 
+class OptionInput(BaseModel):
+    text: Optional[str] = None
+    image_url: Optional[str] = None
+
 class AddQuestionRequest(BaseModel):
     subject_id: int
     text: str
-    options: list[str]
+    options: list[OptionInput]   # каждый вариант может быть текстом или картинкой
     correct_index: int
-    image_url: Optional[str] = None
+    image_url: Optional[str] = None  # картинка вопроса
 
 
 @app.post("/admin/questions")
@@ -305,8 +309,11 @@ def add_question(payload: AddQuestionRequest, db: Session = Depends(get_db), use
         raise HTTPException(status_code=400, detail="Нужно минимум 2 варианта")
     q = Question(subject_id=payload.subject_id, text=payload.text, image_url=payload.image_url, correct_option_id=payload.correct_index)
     db.add(q); db.flush()
-    for i, t in enumerate(payload.options):
-        db.add(Option(question_id=q.id, text=t, order_index=i))
+    for i, opt in enumerate(payload.options):
+        if isinstance(opt, str):
+            db.add(Option(question_id=q.id, text=opt, order_index=i))
+        else:
+            db.add(Option(question_id=q.id, text=opt.text, image_url=opt.image_url, order_index=i))
     db.commit()
     return {"id": q.id, "message": "Вопрос добавлен ✅"}
 
@@ -316,6 +323,16 @@ async def upload_image(file: UploadFile = File(...), user: User = Depends(requir
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Только картинки!")
     filename = f"{uuid.uuid4()}.{file.filename.split('.')[-1]}"
+    async with aiofiles.open(f"uploads/{filename}", "wb") as f:
+        f.write(await file.read())
+    return {"image_url": f"/uploads/{filename}"}
+
+@app.post("/admin/upload-option-image")
+async def upload_option_image(file: UploadFile = File(...), user: User = Depends(require_teacher)):
+    """Загрузка картинки для варианта ответа"""
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Только картинки!")
+    filename = f"opt_{uuid.uuid4()}.{file.filename.split('.')[-1]}"
     async with aiofiles.open(f"uploads/{filename}", "wb") as f:
         f.write(await file.read())
     return {"image_url": f"/uploads/{filename}"}
@@ -607,7 +624,7 @@ def get_duel_questions(duel_id: int, db: Session = Depends(get_db), user: User =
         options = db.query(Option).filter(Option.question_id == q.id).order_by(Option.order_index).all()
         output.append({"id": q.id, "text": q.text, "image_url": q.image_url,
                        "correct_option_id": q.correct_option_id,
-                       "options": [{"id": o.id, "text": o.text} for o in options]})
+                       "options": [{"id": o.id, "text": o.text, "image_url": o.image_url} for o in options]})
     return output
 
 

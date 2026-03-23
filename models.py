@@ -52,7 +52,8 @@ class Option(Base):
 
     id = Column(Integer, primary_key=True)
     question_id = Column(Integer, ForeignKey("questions.id"), nullable=False)
-    text = Column(String(2000), nullable=False)
+    text = Column(String(2000), nullable=True)   # текст варианта (необязательно если есть картинка)
+    image_url = Column(String(500), nullable=True) # картинка варианта
     order_index = Column(Integer, default=0)
 
     question = relationship("Question", back_populates="options")

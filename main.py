@@ -274,6 +274,83 @@ def submit_result(payload: SubmitResultRequest, db: Session = Depends(get_db), u
     }
 
 
+
+@app.get("/rating/{subject_id}")
+def get_rating(subject_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Рейтинг по предмету — доступен всем авторизованным"""
+    rows = (
+        db.query(Result, User, Subject)
+        .join(User, Result.user_id == User.id)
+        .join(Subject, Result.subject_id == Subject.id)
+        .filter(Result.subject_id == subject_id)
+        .order_by(Result.created_at.desc())
+        .all()
+    )
+    # Берём лучший результат каждого студента
+    best = {}
+    for r in rows:
+        name = r.User.full_name or r.User.username
+        pct = round(r.Result.score / r.Result.total * 100) if r.Result.total else 0
+        if name not in best or pct > best[name]["pct"]:
+            best[name] = {
+                "name": name,
+                "score": r.Result.score,
+                "total": r.Result.total,
+                "pct": pct
+            }
+    return sorted(best.values(), key=lambda x: x["pct"], reverse=True)
+
+
+@app.get("/rating")
+def get_rating_all(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Рейтинг по всем предметам — доступен всем"""
+    rows = (
+        db.query(Result, User, Subject)
+        .join(User, Result.user_id == User.id)
+        .join(Subject, Result.subject_id == Subject.id)
+        .order_by(Result.created_at.desc())
+        .all()
+    )
+    result = []
+    for r in rows:
+        result.append({
+            "student": r.User.full_name or r.User.username,
+            "username": r.User.username,
+            "subject": r.Subject.title,
+            "subject_id": r.Subject.id,
+            "score": r.Result.score,
+            "total": r.Result.total,
+            "date": r.Result.created_at.isoformat() if r.Result.created_at else None
+        })
+    return result
+
+
+
+@app.get("/my-progress/{subject_id}")
+def my_progress(subject_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Прогресс студента по конкретному предмету"""
+    results = (
+        db.query(Result)
+        .filter(Result.user_id == user.id, Result.subject_id == subject_id)
+        .order_by(Result.created_at.desc())
+        .all()
+    )
+    if not results:
+        return {"attempts": 0, "best_score": 0, "best_pct": 0, "last_score": 0, "last_pct": 0, "total": 0}
+
+    best = max(results, key=lambda r: r.score / r.total if r.total else 0)
+    last = results[0]
+    return {
+        "attempts": len(results),
+        "best_score": best.score,
+        "best_total": best.total,
+        "best_pct": round(best.score / best.total * 100) if best.total else 0,
+        "last_score": last.score,
+        "last_total": last.total,
+        "last_pct": round(last.score / last.total * 100) if last.total else 0,
+    }
+
+
 @app.get("/my-results")
 def my_results(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     rows = db.query(Result, Subject).join(Subject, Result.subject_id == Subject.id).filter(Result.user_id == user.id).order_by(Result.created_at.desc()).all()

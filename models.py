@@ -41,7 +41,7 @@ class Question(Base):
     subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=False)
     text = Column(Text, nullable=False)
     image_url = Column(String(500), nullable=True)
-    correct_option_id = Column(Integer, nullable=False)
+    correct_option_id = Column(Integer, nullable=True)
 
     subject = relationship("Subject", back_populates="questions")
     options = relationship("Option", back_populates="question", cascade="all, delete")

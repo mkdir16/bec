@@ -16,6 +16,8 @@ import string
 from database import get_db, engine, Base
 from models import User, Subject, Question, Option, Result, UserAchievement, Duel
 from auth import create_token, verify_token
+import re
+from docx import Document
 
 app = FastAPI(title="UniQuiz API")
 
@@ -512,7 +514,221 @@ async def import_questions(
     finally:
         import os as _os
         _os.unlink(tmp_path)
+@app.post("/admin/import-questions-word")
+async def import_questions_word(
+    subject_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_teacher)
+):
+    """Импорт вопросов из Word файла (.docx)"""
+    if not file.filename.endswith('.docx'):
+        raise HTTPException(status_code=400, detail="Только Word файлы (.docx)")
 
+    subject = db.query(Subject).filter(Subject.id == subject_id).first()
+    if not subject:
+        raise HTTPException(status_code=404, detail="Предмет не найден")
+
+    content = await file.read()
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        doc = Document(tmp_path)
+        full_text = []
+        for paragraph in doc.paragraphs:
+            text = paragraph.text.strip()
+            if text:
+                full_text.append(text)
+        
+        text = '\n'.join(full_text)
+        
+        questions_data = parse_word_questions(text)
+        
+        if not questions_data:
+            raise HTTPException(status_code=400, detail="Не удалось найти вопросы в файле")
+        
+        added = 0
+        errors = []
+        
+        for i, q_data in enumerate(questions_data):
+            try:
+                if not q_data.get("question"):
+                    errors.append(f"Вопрос {i+1}: пустой текст вопроса")
+                    continue
+                
+                options = q_data.get("options", [])
+                if len(options) < 2:
+                    errors.append(f"Вопрос {i+1}: нужно минимум 2 варианта ответа")
+                    continue
+                
+                correct_letter = q_data.get("correct", "").strip().upper()
+                letter_to_index = {"А": 0, "Б": 1, "В": 2, "Г": 3, "Д": 4, "A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
+                
+                if correct_letter not in letter_to_index:
+                    errors.append(f"Вопрос {i+1}: неверный правильный ответ")
+                    continue
+                
+                correct_index = letter_to_index[correct_letter]
+                if correct_index >= len(options):
+                    errors.append(f"Вопрос {i+1}: правильный ответ не соответствует вариантам")
+                    continue
+                
+                q = Question(
+                    subject_id=subject_id,
+                    text=q_data["question"],
+                    correct_option_id=correct_index
+                )
+                db.add(q)
+                db.flush()
+                
+                for idx, opt_text in enumerate(options):
+                    db.add(Option(question_id=q.id, text=opt_text, order_index=idx))
+                
+                added += 1
+                
+            except Exception as e:
+                errors.append(f"Вопрос {i+1}: ошибка - {str(e)}")
+        
+        db.commit()
+        
+        result = {"added": added, "errors": errors[:20]}
+        if errors:
+            result["message"] = f"Добавлено {added} вопросов, пропущено {len(errors)} строк с ошибками"
+        else:
+            result["message"] = f"Успешно добавлено {added} вопросов ✅"
+        
+        return result
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Ошибка чтения файла: {str(e)}")
+    finally:
+        import os as _os
+        _os.unlink(tmp_path)
+
+
+def parse_word_questions(text: str) -> list:
+    """Парсит текст Word документа в список вопросов"""
+    questions = []
+    lines = text.split('\n')
+    
+    current_question = None
+    current_options = []
+    current_correct = None
+    
+    question_pattern = re.compile(r'^(\d+)[\.\)]\s*(.+)$')
+    option_pattern = re.compile(r'^([А-ДA-D])[\.\)]\s*(.+)$')
+    answer_pattern = re.compile(r'[Оо]твет:\s*([А-ДA-D])')
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        if not line:
+            i += 1
+            continue
+        
+        answer_match = answer_pattern.search(line)
+        if answer_match:
+            if current_question is not None:
+                current_correct = answer_match.group(1)
+                if current_question and current_options:
+                    questions.append({
+                        "question": current_question,
+                        "options": current_options,
+                        "correct": current_correct
+                    })
+                current_question = None
+                current_options = []
+                current_correct = None
+            i += 1
+            continue
+        
+        option_match = option_pattern.match(line)
+        if option_match:
+            if current_question is not None:
+                current_options.append(option_match.group(2))
+            i += 1
+            continue
+        
+        question_match = question_pattern.match(line)
+        if question_match:
+            if current_question is not None and current_options:
+                questions.append({
+                    "question": current_question,
+                    "options": current_options,
+                    "correct": None
+                })
+            current_question = question_match.group(2)
+            current_options = []
+            current_correct = None
+            i += 1
+            continue
+        
+        if current_question is not None and not option_match:
+            current_question += " " + line
+        
+        i += 1
+    
+    if current_question is not None and current_options:
+        questions.append({
+            "question": current_question,
+            "options": current_options,
+            "correct": current_correct
+        })
+    
+    return questions
+
+
+@app.get("/admin/download-word-template")
+def download_word_template(user: User = Depends(require_teacher)):
+    """Скачать шаблон Word для импорта вопросов"""
+    from docx import Document
+    from fastapi.responses import StreamingResponse
+    import io
+    
+    doc = Document()
+    
+    doc.add_heading('Шаблон для импорта вопросов в UniQuiz', 0)
+    doc.add_paragraph('Формат: каждый вопрос начинается с номера, варианты ответов с букв А), Б), В), Г), ответ указывается отдельной строкой "Ответ: X"')
+    doc.add_paragraph('')
+    
+    doc.add_heading('Пример:', level=1)
+    doc.add_paragraph('1. Какой город является столицей Узбекистана?')
+    doc.add_paragraph('А) Самарканд')
+    doc.add_paragraph('Б) Бухара')
+    doc.add_paragraph('В) Ташкент')
+    doc.add_paragraph('Г) Наманган')
+    doc.add_paragraph('Ответ: В')
+    doc.add_paragraph('')
+    
+    doc.add_paragraph('2. Сколько будет 2+2?')
+    doc.add_paragraph('А) 3')
+    doc.add_paragraph('Б) 4')
+    doc.add_paragraph('В) 5')
+    doc.add_paragraph('Г) 6')
+    doc.add_paragraph('Ответ: Б')
+    doc.add_paragraph('')
+    
+    doc.add_paragraph('3. Вставьте ваш вопрос здесь...')
+    doc.add_paragraph('А) Вариант 1')
+    doc.add_paragraph('Б) Вариант 2')
+    doc.add_paragraph('В) Вариант 3')
+    doc.add_paragraph('Г) Вариант 4')
+    doc.add_paragraph('Ответ: А')
+    
+    file_stream = io.BytesIO()
+    doc.save(file_stream)
+    file_stream.seek(0)
+    
+    return StreamingResponse(
+        file_stream,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": "attachment; filename=UniQuiz_шаблон_вопросов.docx"}
+    )
 
 @app.get("/admin/results")
 def get_all_results(db: Session = Depends(get_db), user: User = Depends(require_teacher)):

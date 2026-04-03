@@ -16,8 +16,6 @@ import string
 from database import get_db, engine, Base
 from models import User, Subject, Question, Option, Result, UserAchievement, Duel
 from auth import create_token, verify_token
-import re
-from docx import Document
 
 app = FastAPI(title="UniQuiz API")
 
@@ -28,6 +26,42 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 SUBSCRIPTION_DAYS = 30
 FREE_TRIAL_DAYS = 3
+
+# ── SUPABASE STORAGE ──────────────────────────────────────────────────────
+import httpx as _httpx
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+SUPABASE_BUCKET = "images"
+
+async def upload_to_storage(file: UploadFile, folder: str = "questions") -> str:
+    """Загружает файл в Supabase Storage"""
+    content_bytes = await file.read()
+    ext = file.filename.split(".")[-1].lower()
+    filename = f"{folder}/{uuid.uuid4()}.{ext}"
+
+    if SUPABASE_URL and SUPABASE_KEY:
+        upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{filename}"
+        headers = {
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": file.content_type or "image/jpeg",
+            "x-upsert": "true"
+        }
+        async with _httpx.AsyncClient() as client:
+            resp = await client.post(upload_url, content=content_bytes, headers=headers)
+            if resp.status_code not in (200, 201):
+                raise HTTPException(status_code=500, detail=f"Ошибка загрузки: {resp.text}")
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{filename}"
+        return public_url
+    else:
+        # Локально если Supabase не настроен
+        os.makedirs("uploads", exist_ok=True)
+        local_filename = f"uploads/{uuid.uuid4()}.{ext}"
+        async with aiofiles.open(local_filename, "wb") as f:
+            f.write(content_bytes)
+        return f"/{local_filename}"
+
+
 
 
 def hash_password(p: str) -> str:
@@ -105,6 +139,7 @@ def user_to_dict(user: User) -> dict:
         "subscription_expires": user.subscription_expires.isoformat() if user.subscription_expires else None,
         "days_left": days_left,
         "is_trial": user.is_trial,
+        "phone": user.phone,
     }
 
 
@@ -133,11 +168,34 @@ class RegisterRequest(BaseModel):
     full_name: str        # Имя студента
     username: str         # Придуманный логин
     password: str         # Пароль
+    phone: str            # Номер телефона (уникальный)
 
 
 @app.post("/register")
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     """Самостоятельная регистрация студента — получает 3 дня бесплатно"""
+
+    # Нормализуем телефон — только цифры
+    import re as _re
+    phone_clean = _re.sub(r'[^0-9]', '', payload.phone or "")
+    if len(phone_clean) < 9:
+        raise HTTPException(status_code=400, detail="Введи корректный номер телефона")
+    # Приводим к формату +998XXXXXXXXX
+    if phone_clean.startswith("998"):
+        phone_clean = "+" + phone_clean
+    elif phone_clean.startswith("8") and len(phone_clean) == 11:
+        phone_clean = "+7" + phone_clean[1:]
+    else:
+        phone_clean = "+998" + phone_clean.lstrip("0")
+
+    # Проверяем что номер не занят
+    existing_phone = db.query(User).filter(User.phone == phone_clean).first()
+    if existing_phone:
+        # Проверяем был ли пробный период
+        if existing_phone.is_trial and not existing_phone.subscription_active:
+            raise HTTPException(status_code=400, detail="С этого номера уже использовался пробный период. Для продолжения оплати подписку — @mkdir16")
+        else:
+            raise HTTPException(status_code=400, detail="Этот номер телефона уже зарегистрирован")
 
     # Проверяем что логин не занят
     if db.query(User).filter(User.username == payload.username).first():
@@ -156,6 +214,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         username=payload.username.lower().strip(),
         password_hash=hash_password(payload.password),
         full_name=payload.full_name.strip(),
+        phone=phone_clean,
         role="student",
         subscription_active=True,
         subscription_expires=datetime.utcnow() + timedelta(days=FREE_TRIAL_DAYS),
@@ -401,20 +460,16 @@ def add_question(payload: AddQuestionRequest, db: Session = Depends(get_db), use
 async def upload_image(file: UploadFile = File(...), user: User = Depends(require_teacher)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Только картинки!")
-    filename = f"{uuid.uuid4()}.{file.filename.split('.')[-1]}"
-    async with aiofiles.open(f"uploads/{filename}", "wb") as f:
-        f.write(await file.read())
-    return {"image_url": f"/uploads/{filename}"}
+    image_url = await upload_to_storage(file, folder="uniquiz/questions")
+    return {"image_url": image_url}
 
 @app.post("/admin/upload-option-image")
 async def upload_option_image(file: UploadFile = File(...), user: User = Depends(require_teacher)):
     """Загрузка картинки для варианта ответа"""
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Только картинки!")
-    filename = f"opt_{uuid.uuid4()}.{file.filename.split('.')[-1]}"
-    async with aiofiles.open(f"uploads/{filename}", "wb") as f:
-        f.write(await file.read())
-    return {"image_url": f"/uploads/{filename}"}
+    image_url = await upload_to_storage(file, folder="uniquiz/options")
+    return {"image_url": image_url}
 
 
 @app.post("/admin/import-questions")
@@ -514,221 +569,7 @@ async def import_questions(
     finally:
         import os as _os
         _os.unlink(tmp_path)
-@app.post("/admin/import-questions-word")
-async def import_questions_word(
-    subject_id: int,
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    user: User = Depends(require_teacher)
-):
-    """Импорт вопросов из Word файла (.docx)"""
-    if not file.filename.endswith('.docx'):
-        raise HTTPException(status_code=400, detail="Только Word файлы (.docx)")
 
-    subject = db.query(Subject).filter(Subject.id == subject_id).first()
-    if not subject:
-        raise HTTPException(status_code=404, detail="Предмет не найден")
-
-    content = await file.read()
-    import tempfile
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
-
-    try:
-        doc = Document(tmp_path)
-        full_text = []
-        for paragraph in doc.paragraphs:
-            text = paragraph.text.strip()
-            if text:
-                full_text.append(text)
-        
-        text = '\n'.join(full_text)
-        
-        questions_data = parse_word_questions(text)
-        
-        if not questions_data:
-            raise HTTPException(status_code=400, detail="Не удалось найти вопросы в файле")
-        
-        added = 0
-        errors = []
-        
-        for i, q_data in enumerate(questions_data):
-            try:
-                if not q_data.get("question"):
-                    errors.append(f"Вопрос {i+1}: пустой текст вопроса")
-                    continue
-                
-                options = q_data.get("options", [])
-                if len(options) < 2:
-                    errors.append(f"Вопрос {i+1}: нужно минимум 2 варианта ответа")
-                    continue
-                
-                correct_letter = q_data.get("correct", "").strip().upper()
-                letter_to_index = {"А": 0, "Б": 1, "В": 2, "Г": 3, "Д": 4, "A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
-                
-                if correct_letter not in letter_to_index:
-                    errors.append(f"Вопрос {i+1}: неверный правильный ответ")
-                    continue
-                
-                correct_index = letter_to_index[correct_letter]
-                if correct_index >= len(options):
-                    errors.append(f"Вопрос {i+1}: правильный ответ не соответствует вариантам")
-                    continue
-                
-                q = Question(
-                    subject_id=subject_id,
-                    text=q_data["question"],
-                    correct_option_id=correct_index
-                )
-                db.add(q)
-                db.flush()
-                
-                for idx, opt_text in enumerate(options):
-                    db.add(Option(question_id=q.id, text=opt_text, order_index=idx))
-                
-                added += 1
-                
-            except Exception as e:
-                errors.append(f"Вопрос {i+1}: ошибка - {str(e)}")
-        
-        db.commit()
-        
-        result = {"added": added, "errors": errors[:20]}
-        if errors:
-            result["message"] = f"Добавлено {added} вопросов, пропущено {len(errors)} строк с ошибками"
-        else:
-            result["message"] = f"Успешно добавлено {added} вопросов ✅"
-        
-        return result
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=400, detail=f"Ошибка чтения файла: {str(e)}")
-    finally:
-        import os as _os
-        _os.unlink(tmp_path)
-
-
-def parse_word_questions(text: str) -> list:
-    """Парсит текст Word документа в список вопросов"""
-    questions = []
-    lines = text.split('\n')
-    
-    current_question = None
-    current_options = []
-    current_correct = None
-    
-    question_pattern = re.compile(r'^(\d+)[\.\)]\s*(.+)$')
-    option_pattern = re.compile(r'^([А-ДA-D])[\.\)]\s*(.+)$')
-    answer_pattern = re.compile(r'[Оо]твет:\s*([А-ДA-D])')
-    
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        
-        if not line:
-            i += 1
-            continue
-        
-        answer_match = answer_pattern.search(line)
-        if answer_match:
-            if current_question is not None:
-                current_correct = answer_match.group(1)
-                if current_question and current_options:
-                    questions.append({
-                        "question": current_question,
-                        "options": current_options,
-                        "correct": current_correct
-                    })
-                current_question = None
-                current_options = []
-                current_correct = None
-            i += 1
-            continue
-        
-        option_match = option_pattern.match(line)
-        if option_match:
-            if current_question is not None:
-                current_options.append(option_match.group(2))
-            i += 1
-            continue
-        
-        question_match = question_pattern.match(line)
-        if question_match:
-            if current_question is not None and current_options:
-                questions.append({
-                    "question": current_question,
-                    "options": current_options,
-                    "correct": None
-                })
-            current_question = question_match.group(2)
-            current_options = []
-            current_correct = None
-            i += 1
-            continue
-        
-        if current_question is not None and not option_match:
-            current_question += " " + line
-        
-        i += 1
-    
-    if current_question is not None and current_options:
-        questions.append({
-            "question": current_question,
-            "options": current_options,
-            "correct": current_correct
-        })
-    
-    return questions
-
-
-@app.get("/admin/download-word-template")
-def download_word_template(user: User = Depends(require_teacher)):
-    """Скачать шаблон Word для импорта вопросов"""
-    from docx import Document
-    from fastapi.responses import StreamingResponse
-    import io
-    
-    doc = Document()
-    
-    doc.add_heading('Шаблон для импорта вопросов в UniQuiz', 0)
-    doc.add_paragraph('Формат: каждый вопрос начинается с номера, варианты ответов с букв А), Б), В), Г), ответ указывается отдельной строкой "Ответ: X"')
-    doc.add_paragraph('')
-    
-    doc.add_heading('Пример:', level=1)
-    doc.add_paragraph('1. Какой город является столицей Узбекистана?')
-    doc.add_paragraph('А) Самарканд')
-    doc.add_paragraph('Б) Бухара')
-    doc.add_paragraph('В) Ташкент')
-    doc.add_paragraph('Г) Наманган')
-    doc.add_paragraph('Ответ: В')
-    doc.add_paragraph('')
-    
-    doc.add_paragraph('2. Сколько будет 2+2?')
-    doc.add_paragraph('А) 3')
-    doc.add_paragraph('Б) 4')
-    doc.add_paragraph('В) 5')
-    doc.add_paragraph('Г) 6')
-    doc.add_paragraph('Ответ: Б')
-    doc.add_paragraph('')
-    
-    doc.add_paragraph('3. Вставьте ваш вопрос здесь...')
-    doc.add_paragraph('А) Вариант 1')
-    doc.add_paragraph('Б) Вариант 2')
-    doc.add_paragraph('В) Вариант 3')
-    doc.add_paragraph('Г) Вариант 4')
-    doc.add_paragraph('Ответ: А')
-    
-    file_stream = io.BytesIO()
-    doc.save(file_stream)
-    file_stream.seek(0)
-    
-    return StreamingResponse(
-        file_stream,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": "attachment; filename=UniQuiz_шаблон_вопросов.docx"}
-    )
 
 @app.get("/admin/results")
 def get_all_results(db: Session = Depends(get_db), user: User = Depends(require_teacher)):
@@ -746,6 +587,7 @@ def get_all_users(db: Session = Depends(get_db), user: User = Depends(require_ad
         "role": u.role, "subscription_active": u.subscription_active,
         "subscription_expires": u.subscription_expires.isoformat() if u.subscription_expires else None,
         "is_trial": u.is_trial,
+        "phone": u.phone,
         "created_at": u.created_at.isoformat() if u.created_at else None,
     } for u in users]
 

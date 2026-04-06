@@ -571,6 +571,51 @@ async def import_questions(
         _os.unlink(tmp_path)
 
 
+
+@app.get("/admin/questions/{subject_id}")
+def get_all_questions_admin(subject_id: int, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
+    """Все вопросы предмета с правильными ответами — для панели управления"""
+    questions = db.query(Question).filter(Question.subject_id == subject_id).all()
+    output = []
+    for q in questions:
+        options = db.query(Option).filter(Option.question_id == q.id).order_by(Option.order_index).all()
+        output.append({
+            "id": q.id, "text": q.text, "image_url": q.image_url,
+            "correct_option_id": q.correct_option_id,
+            "options": [{"id": o.id, "text": o.text, "image_url": o.image_url} for o in options]
+        })
+    return output
+
+
+@app.delete("/admin/questions/{question_id}")
+def delete_question(question_id: int, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
+    """Удалить вопрос"""
+    q = db.query(Question).filter(Question.id == question_id).first()
+    if not q:
+        raise HTTPException(status_code=404, detail="Вопрос не найден")
+    db.delete(q); db.commit()
+    return {"message": "Вопрос удалён ✅"}
+
+
+@app.put("/admin/questions/{question_id}")
+def edit_question(question_id: int, payload: AddQuestionRequest, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
+    """Редактировать вопрос"""
+    q = db.query(Question).filter(Question.id == question_id).first()
+    if not q:
+        raise HTTPException(status_code=404, detail="Вопрос не найден")
+    q.text = payload.text
+    q.correct_option_id = payload.correct_index
+    if payload.image_url is not None:
+        q.image_url = payload.image_url
+    db.query(Option).filter(Option.question_id == question_id).delete()
+    for i, opt in enumerate(payload.options):
+        if isinstance(opt, str):
+            db.add(Option(question_id=q.id, text=opt, order_index=i))
+        else:
+            db.add(Option(question_id=q.id, text=opt.text, image_url=getattr(opt, 'image_url', None), order_index=i))
+    db.commit()
+    return {"message": "Вопрос обновлён ✅"}
+
 @app.get("/admin/results")
 def get_all_results(db: Session = Depends(get_db), user: User = Depends(require_teacher)):
     rows = db.query(Result, User, Subject).join(User, Result.user_id == User.id).join(Subject, Result.subject_id == Subject.id).order_by(Result.created_at.desc()).all()

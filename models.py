@@ -16,6 +16,7 @@ class User(Base):
     subscription_expires = Column(DateTime, nullable=True)
     is_trial = Column(Boolean, default=False)
     phone = Column(String(20), nullable=True, unique=True, index=True)
+    lang = Column(String(5), default="ru")  # предпочитаемый язык
 
     created_at = Column(DateTime, server_default=func.now())
 

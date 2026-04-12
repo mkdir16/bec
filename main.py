@@ -140,6 +140,7 @@ def user_to_dict(user: User) -> dict:
         "days_left": days_left,
         "is_trial": user.is_trial,
         "phone": user.phone,
+        "lang": user.lang or "ru",
     }
 
 
@@ -169,6 +170,7 @@ class RegisterRequest(BaseModel):
     username: str         # Придуманный логин
     password: str         # Пароль
     phone: str            # Номер телефона (уникальный)
+    lang: str = "ru"      # Язык интерфейса
 
 
 @app.post("/register")
@@ -215,6 +217,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         password_hash=hash_password(payload.password),
         full_name=payload.full_name.strip(),
         phone=phone_clean,
+        lang=payload.lang,
         role="student",
         subscription_active=True,
         subscription_expires=datetime.utcnow() + timedelta(days=FREE_TRIAL_DAYS),
@@ -235,13 +238,22 @@ def get_me(user: User = Depends(get_current_user)):
 
 # ── ПРЕДМЕТЫ И ВОПРОСЫ ───────────────────────────────────────────────────
 
+
+@app.post("/me/lang")
+def update_lang(lang: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if lang not in ["ru", "uz", "en"]:
+        raise HTTPException(status_code=400, detail="Язык: ru, uz, en")
+    user.lang = lang
+    db.commit()
+    return {"lang": lang}
+
 @app.get("/subjects")
 def get_subjects(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     subjects = db.query(Subject).all()
     result = []
     for s in subjects:
         total = db.query(Question).filter(Question.subject_id == s.id).count()
-        result.append({"id": s.id, "title": s.title, "emoji": s.emoji, "time_limit": s.time_limit, "question_count": s.question_count or 30, "total_questions": total})
+        result.append({"id": s.id, "title": s.title, "emoji": s.emoji, "time_limit": s.time_limit, "question_count": s.question_count or 30, "total_questions": total, "lang": s.lang or "all"})
     return result
 
 
@@ -421,8 +433,8 @@ def my_results(db: Session = Depends(get_db), user: User = Depends(get_current_u
 # ── АДМИН: ПРЕДМЕТЫ ──────────────────────────────────────────────────────
 
 @app.post("/admin/subjects")
-def create_subject(title: str, emoji: str = "📚", time_limit: int = 60, question_count: int = 30, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
-    s = Subject(title=title, emoji=emoji, time_limit=time_limit, question_count=question_count)
+def create_subject(title: str, emoji: str = "📚", time_limit: int = 60, question_count: int = 30, lang: str = "all", db: Session = Depends(get_db), user: User = Depends(require_teacher)):
+    s = Subject(title=title, emoji=emoji, time_limit=time_limit, question_count=question_count, lang=lang)
     db.add(s); db.commit(); db.refresh(s)
     return {"id": s.id, "title": s.title, "time_limit": s.time_limit, "question_count": s.question_count}
 

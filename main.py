@@ -20,27 +20,39 @@ from models import User, Subject, Question, Option, Result, UserAchievement, Due
 from auth import create_token, verify_token
 
 
-# ====================== LIFESPAN ======================
+# ====================== HASH ======================
+def hash_password(p: str) -> str:
+    return hashlib.sha256(p.encode()).hexdigest()
+
+
+# ====================== LIFESPAN (ИСПРАВЛЕН) ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # Startup - создаём таблицы
     Base.metadata.create_all(bind=engine)
-    db = next(get_db())
-    admin = db.query(User).filter(User.username == "admin").first()
-    if not admin:
-        db.add(User(
-            username="admin",
-            password_hash=hash_password("admin123"),
-            full_name="Администратор",
-            role="admin",
-            subscription_active=True,
-            is_trial=False
-        ))
-        db.commit()
-        print("✅ Админ создан: admin / admin123")
-    print("✅ База данных готова")
+    
+    # Создаём отдельную сессию для проверки/создания админа
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        admin = db.query(User).filter(User.username == "admin").first()
+        if not admin:
+            db.add(User(
+                username="admin",
+                password_hash=hash_password("admin123"),
+                full_name="Администратор",
+                role="admin",
+                subscription_active=True,
+                is_trial=False
+            ))
+            db.commit()
+            print("✅ Админ создан: admin / admin123")
+        print("✅ База данных готова")
+    finally:
+        db.close()
+    
     yield
-    # Shutdown (при необходимости можно добавить очистку)
+    # Shutdown - ничего не делаем
 
 
 # ====================== FASTAPI APP ======================
@@ -50,7 +62,8 @@ app = FastAPI(title="UniQuiz API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://fron-alpha.vercel.app",   # твой фронтенд на Vercel
+        "https://fron-alpha.vercel.app",
+        "https://www.fron-alpha.vercel.app",
         "http://localhost:3000",
         "http://localhost:5173",
         "http://127.0.0.1:3000",
@@ -99,10 +112,6 @@ async def upload_to_storage(file: UploadFile, folder: str = "questions") -> str:
         async with aiofiles.open(local_filename, "wb") as f:
             await f.write(content_bytes)
         return f"/{local_filename}"
-
-
-def hash_password(p: str) -> str:
-    return hashlib.sha256(p.encode()).hexdigest()
 
 
 # ====================== AUTH DEPENDENCIES ======================
@@ -259,7 +268,7 @@ def update_lang(lang: str, db: Session = Depends(get_db), user: User = Depends(g
     return {"lang": lang}
 
 
-# ── ПУБЛИЧНЫЙ РОУТ ПРЕДМЕТОВ (главное исправление для CORS) ──
+# ── ПРЕДМЕТЫ (ГЛАВНЫЙ ИСПРАВЛЕННЫЙ РОУТ) ──
 @app.get("/subjects")
 def get_subjects(db: Session = Depends(get_db)):
     subjects = db.query(Subject).all()
@@ -279,7 +288,6 @@ def get_subjects(db: Session = Depends(get_db)):
 
 
 # ====================== ОСТАЛЬНЫЕ РОУТЫ ======================
-# (всё, что было в твоём оригинальном коде после /subjects)
 
 @app.get("/questions/{subject_id}")
 def get_questions(
@@ -363,19 +371,8 @@ def submit_result(payload: SubmitResultRequest, db: Session = Depends(get_db), u
     }
 
 
-# ... (все остальные роуты: /rating, /my-progress, /my-results, admin/subjects, admin/questions, upload-image, import-questions и т.д.)
-
-# Я оставил здесь только ключевые, чтобы сообщение не было бесконечным. 
-# Если у тебя возникнут ошибки при копировании — скажи, я пришлю оставшуюся часть (admin-роуты, дуэли, достижения).
-
-# Пока скопируй этот код, передеплой и проверь /subjects.
-
-# Если после деплоя всё ещё будет ошибка — зайди в **Logs** на Render и пришли сюда, что там пишется при запросе к /subjects.
-
-
 @app.get("/rating/{subject_id}")
 def get_rating(subject_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Рейтинг по предмету — доступен всем авторизованным"""
     rows = (
         db.query(Result, User, Subject)
         .join(User, Result.user_id == User.id)
@@ -384,7 +381,6 @@ def get_rating(subject_id: int, db: Session = Depends(get_db), user: User = Depe
         .order_by(Result.created_at.desc())
         .all()
     )
-    # Берём лучший результат каждого студента
     best = {}
     for r in rows:
         name = r.User.full_name or r.User.username
@@ -401,7 +397,6 @@ def get_rating(subject_id: int, db: Session = Depends(get_db), user: User = Depe
 
 @app.get("/rating")
 def get_rating_all(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Рейтинг по всем предметам — доступен всем"""
     rows = (
         db.query(Result, User, Subject)
         .join(User, Result.user_id == User.id)
@@ -423,10 +418,8 @@ def get_rating_all(db: Session = Depends(get_db), user: User = Depends(get_curre
     return result
 
 
-
 @app.get("/my-progress/{subject_id}")
 def my_progress(subject_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Прогресс студента по конкретному предмету"""
     results = (
         db.query(Result)
         .filter(Result.user_id == user.id, Result.subject_id == subject_id)
@@ -473,9 +466,9 @@ class OptionInput(BaseModel):
 class AddQuestionRequest(BaseModel):
     subject_id: int
     text: str
-    options: list[OptionInput]   # каждый вариант может быть текстом или картинкой
+    options: list[OptionInput]
     correct_index: int
-    image_url: Optional[str] = None  # картинка вопроса
+    image_url: Optional[str] = None
 
 
 @app.post("/admin/questions")
@@ -500,9 +493,9 @@ async def upload_image(file: UploadFile = File(...), user: User = Depends(requir
     image_url = await upload_to_storage(file, folder="uniquiz/questions")
     return {"image_url": image_url}
 
+
 @app.post("/admin/upload-option-image")
 async def upload_option_image(file: UploadFile = File(...), user: User = Depends(require_teacher)):
-    """Загрузка картинки для варианта ответа"""
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Только картинки!")
     image_url = await upload_to_storage(file, folder="uniquiz/options")
@@ -516,7 +509,6 @@ async def import_questions(
     db: Session = Depends(get_db),
     user: User = Depends(require_teacher)
 ):
-    """Импорт вопросов из Excel файла"""
     import openpyxl
     import tempfile
 
@@ -527,7 +519,6 @@ async def import_questions(
     if not subject:
         raise HTTPException(status_code=404, detail="Предмет не найден")
 
-    # Сохраняем файл временно
     content = await file.read()
     with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
         tmp.write(content)
@@ -542,7 +533,6 @@ async def import_questions(
         errors = []
 
         for row_num, row in enumerate(ws.iter_rows(min_row=6, values_only=True), start=6):
-            # Пропускаем пустые строки
             if not row[0]:
                 continue
 
@@ -554,7 +544,6 @@ async def import_questions(
             opt_e = str(row[5]).strip() if row[5] else ""
             correct_letter = str(row[6]).strip().upper() if row[6] else ""
 
-            # Проверяем обязательные поля
             if not q_text:
                 errors.append(f"Строка {row_num}: пустой вопрос")
                 continue
@@ -565,7 +554,6 @@ async def import_questions(
                 errors.append(f"Строка {row_num}: неверный правильный ответ '{correct_letter}' (нужно A/Б/В/Г/Д)")
                 continue
 
-            # Собираем варианты
             options = [opt_a, opt_b]
             if opt_c: options.append(opt_c)
             if opt_d: options.append(opt_d)
@@ -576,7 +564,6 @@ async def import_questions(
                 errors.append(f"Строка {row_num}: правильный ответ '{correct_letter}' — варианта нет")
                 continue
 
-            # Добавляем вопрос
             q = Question(
                 subject_id=subject_id,
                 text=q_text,
@@ -592,7 +579,7 @@ async def import_questions(
 
         db.commit()
 
-        result = {"added": added, "errors": errors[:10]}  # максимум 10 ошибок
+        result = {"added": added, "errors": errors[:10]}
         if errors:
             result["message"] = f"Добавлено {added} вопросов, пропущено {len(errors)} строк с ошибками"
         else:
@@ -608,10 +595,8 @@ async def import_questions(
         _os.unlink(tmp_path)
 
 
-
 @app.get("/admin/questions/{subject_id}")
 def get_all_questions_admin(subject_id: int, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
-    """Все вопросы предмета с правильными ответами — для панели управления"""
     questions = db.query(Question).filter(Question.subject_id == subject_id).all()
     output = []
     for q in questions:
@@ -626,7 +611,6 @@ def get_all_questions_admin(subject_id: int, db: Session = Depends(get_db), user
 
 @app.delete("/admin/questions/{question_id}")
 def delete_question(question_id: int, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
-    """Удалить вопрос"""
     q = db.query(Question).filter(Question.id == question_id).first()
     if not q:
         raise HTTPException(status_code=404, detail="Вопрос не найден")
@@ -636,7 +620,6 @@ def delete_question(question_id: int, db: Session = Depends(get_db), user: User 
 
 @app.put("/admin/questions/{question_id}")
 def edit_question(question_id: int, payload: AddQuestionRequest, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
-    """Редактировать вопрос"""
     q = db.query(Question).filter(Question.id == question_id).first()
     if not q:
         raise HTTPException(status_code=404, detail="Вопрос не найден")
@@ -652,6 +635,7 @@ def edit_question(question_id: int, payload: AddQuestionRequest, db: Session = D
             db.add(Option(question_id=q.id, text=opt.text, image_url=getattr(opt, 'image_url', None), order_index=i))
     db.commit()
     return {"message": "Вопрос обновлён ✅"}
+
 
 @app.get("/admin/results")
 def get_all_results(db: Session = Depends(get_db), user: User = Depends(require_teacher)):
@@ -724,6 +708,19 @@ def activate_subscription(user_id: int, days: int = 30, db: Session = Depends(ge
     return {"message": f"Подписка активирована на {days} дней ✅"}
 
 
+@app.post("/admin/set-role")
+def set_role(user_id: int, role: str, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+    if role not in ["admin", "teacher", "student"]:
+        raise HTTPException(status_code=400, detail="Роль: admin, teacher, student")
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Не найден")
+    target.role = role
+    if role in ["admin", "teacher"]:
+        target.subscription_active = True
+        target.is_trial = False
+    db.commit()
+    return {"message": f"Роль {role} назначена ✅"}
 
 
 # ── ДОСТИЖЕНИЯ ────────────────────────────────────────────────────────────
@@ -751,7 +748,6 @@ def get_my_achievements(db: Session = Depends(get_db), user: User = Depends(get_
 
 
 def check_and_award(user_id: int, db: Session, extra: dict = {}):
-    """Проверяем и выдаём достижения после теста"""
     results = db.query(Result).filter(Result.user_id == user_id).all()
     earned = {a.achievement_id for a in db.query(UserAchievement).filter(UserAchievement.user_id == user_id).all()}
     new_achievements = []
@@ -795,11 +791,10 @@ def gen_code():
 
 @app.post("/duel/create")
 def create_duel(subject_id: int, db: Session = Depends(get_db), user: User = Depends(require_subscription)):
-    import random as rnd
     questions = db.query(Question).filter(Question.subject_id == subject_id).all()
     if len(questions) < 10:
         raise HTTPException(status_code=400, detail="Нужно минимум 10 вопросов в предмете")
-    selected = rnd.sample(questions, min(10, len(questions)))
+    selected = random.sample(questions, min(10, len(questions)))
     code = gen_code()
     while db.query(Duel).filter(Duel.code == code).first():
         code = gen_code()
@@ -865,14 +860,12 @@ def submit_duel(duel_id: int, answers: dict, db: Session = Depends(get_db), user
         duel.opponent_score = score
         duel.opponent_finished = True
 
-    # Если оба закончили — определяем победителя
     if duel.challenger_finished and duel.opponent_finished:
         duel.status = "finished"
         if duel.challenger_score > duel.opponent_score:
             duel.winner_id = duel.challenger_id
         elif duel.opponent_score > duel.challenger_score:
             duel.winner_id = duel.opponent_id
-        # При ничьей winner_id остаётся None
         check_and_award(duel.challenger_id, db)
         check_and_award(duel.opponent_id, db)
 
@@ -891,7 +884,6 @@ def duel_status(duel_id: int, db: Session = Depends(get_db), user: User = Depend
     opp_score = duel.opponent_score if is_challenger else duel.challenger_score
     opp_finished = duel.opponent_finished if is_challenger else duel.challenger_finished
 
-    # Берём данные соперника
     opp_id = duel.opponent_id if is_challenger else duel.challenger_id
     opp = db.query(User).filter(User.id == opp_id).first() if opp_id else None
 
@@ -906,17 +898,3 @@ def duel_status(duel_id: int, db: Session = Depends(get_db), user: User = Depend
         "draw": duel.status == "finished" and duel.winner_id is None,
         "code": duel.code
     }
-
-@app.post("/admin/set-role")
-def set_role(user_id: int, role: str, db: Session = Depends(get_db), user: User = Depends(require_admin)):
-    if role not in ["admin", "teacher", "student"]:
-        raise HTTPException(status_code=400, detail="Роль: admin, teacher, student")
-    target = db.query(User).filter(User.id == user_id).first()
-    if not target:
-        raise HTTPException(status_code=404, detail="Не найден")
-    target.role = role
-    if role in ["admin", "teacher"]:
-        target.subscription_active = True
-        target.is_trial = False
-    db.commit()
-    return {"message": f"Роль {role} назначена ✅"}

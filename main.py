@@ -47,7 +47,11 @@ async def lifespan(app: FastAPI):
             ))
             db.commit()
             print("✅ Админ создан: admin / admin123")
+        else:
+            print("✅ Админ уже существует")
         print("✅ База данных готова")
+    except Exception as e:
+        print(f"❌ Ошибка при инициализации БД: {e}")
     finally:
         db.close()
     
@@ -271,20 +275,24 @@ def update_lang(lang: str, db: Session = Depends(get_db), user: User = Depends(g
 # ── ПРЕДМЕТЫ (ГЛАВНЫЙ ИСПРАВЛЕННЫЙ РОУТ) ──
 @app.get("/subjects")
 def get_subjects(db: Session = Depends(get_db)):
-    subjects = db.query(Subject).all()
-    result = []
-    for s in subjects:
-        total = db.query(Question).filter(Question.subject_id == s.id).count()
-        result.append({
-            "id": s.id,
-            "title": s.title,
-            "emoji": s.emoji,
-            "time_limit": s.time_limit,
-            "question_count": s.question_count or 30,
-            "total_questions": total,
-            "lang": s.lang or "all"
-        })
-    return result
+    try:
+        subjects = db.query(Subject).all()
+        result = []
+        for s in subjects:
+            total = db.query(Question).filter(Question.subject_id == s.id).count()
+            result.append({
+                "id": s.id,
+                "title": s.title,
+                "emoji": s.emoji,
+                "time_limit": s.time_limit,
+                "question_count": s.question_count or 30,
+                "total_questions": total,
+                "lang": s.lang or "all"
+            })
+        return result
+    except Exception as e:
+        print(f"❌ Ошибка в /subjects: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ====================== ОСТАЛЬНЫЕ РОУТЫ ======================

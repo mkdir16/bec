@@ -25,7 +25,7 @@ def hash_password(p: str) -> str:
     return hashlib.sha256(p.encode()).hexdigest()
 
 
-# ====================== LIFESPAN (ИСПРАВЛЕН) ======================
+# ====================== LIFESPAN ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup - создаём таблицы
@@ -272,7 +272,7 @@ def update_lang(lang: str, db: Session = Depends(get_db), user: User = Depends(g
     return {"lang": lang}
 
 
-# ── ПРЕДМЕТЫ (ГЛАВНЫЙ ИСПРАВЛЕННЫЙ РОУТ) ──
+# ── ПРЕДМЕТЫ (ИСПРАВЛЕНО - УБРАЛ LANG) ──
 @app.get("/subjects")
 def get_subjects(db: Session = Depends(get_db)):
     try:
@@ -287,7 +287,6 @@ def get_subjects(db: Session = Depends(get_db)):
                 "time_limit": s.time_limit,
                 "question_count": s.question_count or 30,
                 "total_questions": total,
-                "lang": s.lang or "all"
             })
         return result
     except Exception as e:
@@ -460,7 +459,7 @@ def my_results(db: Session = Depends(get_db), user: User = Depends(get_current_u
 
 @app.post("/admin/subjects")
 def create_subject(title: str, emoji: str = "📚", time_limit: int = 60, question_count: int = 30, lang: str = "all", db: Session = Depends(get_db), user: User = Depends(require_teacher)):
-    s = Subject(title=title, emoji=emoji, time_limit=time_limit, question_count=question_count, lang=lang)
+    s = Subject(title=title, emoji=emoji, time_limit=time_limit, question_count=question_count)
     db.add(s); db.commit(); db.refresh(s)
     return {"id": s.id, "title": s.title, "time_limit": s.time_limit, "question_count": s.question_count}
 

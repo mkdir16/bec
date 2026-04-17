@@ -15,10 +15,11 @@ class User(Base):
     subscription_active = Column(Boolean, default=False)
     subscription_expires = Column(DateTime, nullable=True)
     is_trial = Column(Boolean, default=False)
-    phone = Column(String(20), nullable=True, unique=True, index=True)
-    lang = Column(String(5), default="ru")  # предпочитаемый язык
 
     created_at = Column(DateTime, server_default=func.now())
+
+    phone = Column(String(30), nullable=True)
+    lang = Column(String(10), nullable=False, default="ru")
 
     results = relationship("Result", back_populates="user")
     achievements = relationship("UserAchievement", back_populates="user")
@@ -32,6 +33,7 @@ class Subject(Base):
     emoji = Column(String(10), default="📚")
     time_limit = Column(Integer, default=60)
     question_count = Column(Integer, default=30)
+    lang = Column(String(10), nullable=False, default="all")
 
     questions = relationship("Question", back_populates="subject")
 

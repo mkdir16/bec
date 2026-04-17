@@ -20,6 +20,54 @@ from models import User, Subject, Question, Option, Result, UserAchievement, Due
 from auth import create_token, verify_token
 
 
+# ====================== ПЕРЕВОДЫ ======================
+TRANSLATIONS = {
+    "ru": {
+        "trial_used": "С этого номера уже использовался пробный период. Для продолжения оплати подписку — @mkdir16",
+        "phone_registered": "Этот номер телефона уже зарегистрирован",
+        "username_taken": "Этот логин уже занят, придумай другой",
+        "username_short": "Логин должен быть минимум 3 символа",
+        "password_short": "Пароль должен быть минимум 4 символа",
+        "name_required": "Введи своё имя",
+        "invalid_phone": "Введи корректный номер телефона",
+        "invalid_credentials": "Неверный логин или пароль",
+        "subscription_required": "Требуется подписка",
+        "only_teachers": "Только для преподавателей",
+        "only_admin": "Только для администраторов",
+    },
+    "uz": {
+        "trial_used": "Bu raqamdan sinov davri allaqachon foydalanilgan. Davom etish uchun obunani to'lang — @mkdir16",
+        "phone_registered": "Bu telefon raqami allaqachon ro'yxatdan o'tgan",
+        "username_taken": "Bu login band, boshqasini tanlang",
+        "username_short": "Login kamida 3 ta belgi bo'lishi kerak",
+        "password_short": "Parol kamida 4 ta belgi bo'lishi kerak",
+        "name_required": "Ismingizni kiriting",
+        "invalid_phone": "To'g'ri telefon raqamini kiriting",
+        "invalid_credentials": "Login yoki parol noto'g'ri",
+        "subscription_required": "Obuna kerak",
+        "only_teachers": "Faqat o'qituvchilar uchun",
+        "only_admin": "Faqat administratorlar uchun",
+    },
+    "en": {
+        "trial_used": "Trial period already used with this number. Please subscribe — @mkdir16",
+        "phone_registered": "This phone number is already registered",
+        "username_taken": "This username is taken, choose another",
+        "username_short": "Username must be at least 3 characters",
+        "password_short": "Password must be at least 4 characters",
+        "name_required": "Enter your name",
+        "invalid_phone": "Enter a valid phone number",
+        "invalid_credentials": "Invalid username or password",
+        "subscription_required": "Subscription required",
+        "only_teachers": "Only for teachers",
+        "only_admin": "Only for administrators",
+    }
+}
+
+def t(lang: str, key: str) -> str:
+    """Переводит сообщение на нужный язык"""
+    return TRANSLATIONS.get(lang, TRANSLATIONS["ru"]).get(key, TRANSLATIONS["ru"][key])
+
+
 # ====================== HASH ======================
 def hash_password(p: str) -> str:
     return hashlib.sha256(p.encode()).hexdigest()
@@ -145,13 +193,15 @@ def get_current_user(
 
 def require_teacher(user: User = Depends(get_current_user)):
     if user.role not in ["teacher", "admin"]:
-        raise HTTPException(status_code=403, detail="Только для преподавателей")
+        lang = user.lang or "ru"
+        raise HTTPException(status_code=403, detail=t(lang, "only_teachers"))
     return user
 
 
 def require_admin(user: User = Depends(get_current_user)):
     if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Только для администраторов")
+        lang = user.lang or "ru"
+        raise HTTPException(status_code=403, detail=t(lang, "only_admin"))
     return user
 
 
@@ -159,7 +209,8 @@ def require_subscription(user: User = Depends(get_current_user)):
     if user.role in ["admin", "teacher"]:
         return user
     if not user.subscription_active:
-        raise HTTPException(status_code=402, detail="Требуется подписка")
+        lang = user.lang or "ru"
+        raise HTTPException(status_code=402, detail=t(lang, "subscription_required"))
     return user
 
 
@@ -192,13 +243,21 @@ def root():
 class LoginRequest(BaseModel):
     username: str
     password: str
+    lang: str = "ru"
 
 
 @app.post("/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    lang = payload.lang if payload.lang in ["ru", "uz", "en"] else "ru"
+    
     user = db.query(User).filter(User.username == payload.username).first()
     if not user or user.password_hash != hash_password(payload.password):
-        raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+        raise HTTPException(status_code=401, detail=t(lang, "invalid_credentials"))
+    
+    # Обновляем язык пользователя при входе
+    user.lang = lang
+    db.commit()
+    
     return {"token": create_token(user.id, user.role), "user": user_to_dict(user)}
 
 
@@ -212,9 +271,11 @@ class RegisterRequest(BaseModel):
 
 @app.post("/register")
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+    lang = payload.lang if payload.lang in ["ru", "uz", "en"] else "ru"
+    
     phone_clean = re.sub(r'[^0-9]', '', payload.phone or "")
     if len(phone_clean) < 9:
-        raise HTTPException(status_code=400, detail="Введи корректный номер телефона")
+        raise HTTPException(status_code=400, detail=t(lang, "invalid_phone"))
     
     if phone_clean.startswith("998"):
         phone_clean = "+" + phone_clean
@@ -226,26 +287,26 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     existing_phone = db.query(User).filter(User.phone == phone_clean).first()
     if existing_phone:
         if existing_phone.is_trial and not existing_phone.subscription_active:
-            raise HTTPException(status_code=400, detail="С этого номера уже использовался пробный период. Для продолжения оплати подписку — @mkdir16")
+            raise HTTPException(status_code=400, detail=t(lang, "trial_used"))
         else:
-            raise HTTPException(status_code=400, detail="Этот номер телефона уже зарегистрирован")
+            raise HTTPException(status_code=400, detail=t(lang, "phone_registered"))
 
     if db.query(User).filter(User.username == payload.username).first():
-        raise HTTPException(status_code=400, detail="Этот логин уже занят, придумай другой")
+        raise HTTPException(status_code=400, detail=t(lang, "username_taken"))
 
     if len(payload.username) < 3:
-        raise HTTPException(status_code=400, detail="Логин должен быть минимум 3 символа")
+        raise HTTPException(status_code=400, detail=t(lang, "username_short"))
     if len(payload.password) < 4:
-        raise HTTPException(status_code=400, detail="Пароль должен быть минимум 4 символа")
+        raise HTTPException(status_code=400, detail=t(lang, "password_short"))
     if len(payload.full_name.strip()) < 2:
-        raise HTTPException(status_code=400, detail="Введи своё имя")
+        raise HTTPException(status_code=400, detail=t(lang, "name_required"))
 
     new_user = User(
         username=payload.username.lower().strip(),
         password_hash=hash_password(payload.password),
         full_name=payload.full_name.strip(),
         phone=phone_clean,
-        lang=payload.lang,
+        lang=lang,
         role="student",
         subscription_active=True,
         subscription_expires=datetime.utcnow() + timedelta(days=FREE_TRIAL_DAYS),
@@ -272,9 +333,9 @@ def update_lang(lang: str, db: Session = Depends(get_db), user: User = Depends(g
     return {"lang": lang}
 
 
-# ── ПРЕДМЕТЫ (ИСПРАВЛЕНО - УБРАЛ LANG) ──
+# ── ПРЕДМЕТЫ ──
 @app.get("/subjects")
-def get_subjects(db: Session = Depends(get_db)):
+def get_subjects(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     try:
         subjects = db.query(Subject).all()
         result = []
@@ -294,7 +355,7 @@ def get_subjects(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ====================== ОСТАЛЬНЫЕ РОУТЫ ======================
+# ====================== ВОПРОСЫ ======================
 
 @app.get("/questions/{subject_id}")
 def get_questions(
@@ -458,7 +519,7 @@ def my_results(db: Session = Depends(get_db), user: User = Depends(get_current_u
 # ── АДМИН: ПРЕДМЕТЫ ──────────────────────────────────────────────────────
 
 @app.post("/admin/subjects")
-def create_subject(title: str, emoji: str = "📚", time_limit: int = 60, question_count: int = 30, lang: str = "all", db: Session = Depends(get_db), user: User = Depends(require_teacher)):
+def create_subject(title: str, emoji: str = "📚", time_limit: int = 60, question_count: int = 30, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
     s = Subject(title=title, emoji=emoji, time_limit=time_limit, question_count=question_count)
     db.add(s); db.commit(); db.refresh(s)
     return {"id": s.id, "title": s.title, "time_limit": s.time_limit, "question_count": s.question_count}

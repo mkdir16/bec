@@ -289,19 +289,58 @@ def get_me(user: User = Depends(get_current_user)):
     return user_to_dict(user)
 
 
+class LangRequest(BaseModel):
+    lang: str
+
+
 @app.post("/me/lang")
-def update_lang(lang: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    if lang not in ["ru", "uz", "en"]:
+@app.patch("/me/lang")
+def update_lang(
+    payload: Optional[LangRequest] = None,
+    lang: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    """Обновить язык пользователя. Принимает ?lang=ru или JSON {"lang": "ru"}"""
+    effective_lang = (payload.lang if payload else None) or lang
+    if effective_lang not in ["ru", "uz", "en"]:
         raise HTTPException(status_code=400, detail="Язык: ru, uz, en")
-    user.lang = lang
+    user.lang = effective_lang
     db.commit()
-    return {"lang": lang}
+    return {"lang": effective_lang, "message": "Язык обновлён ✅"}
 
 
 @app.get("/subjects")
-def get_subjects(db: Session = Depends(get_db)):
+def get_subjects(
+    lang: Optional[str] = None,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db)
+):
+    """
+    Возвращает предметы. Фильтрация по языку:
+    - Если передан ?lang=ru/uz/en — показываем предметы с этим lang + "all"
+    - Если авторизован — берём lang из профиля пользователя
+    - Иначе — все предметы
+    """
     try:
-        subjects = db.query(Subject).all()
+        # Определяем язык: из параметра, из токена, или None
+        effective_lang = lang
+        if not effective_lang and authorization and authorization.startswith("Bearer "):
+            payload = verify_token(authorization[7:])
+            if payload and "sub" in payload:
+                try:
+                    u = db.query(User).filter(User.id == int(payload["sub"])).first()
+                    if u:
+                        effective_lang = u.lang
+                except Exception:
+                    pass
+
+        query = db.query(Subject)
+        if effective_lang and effective_lang in ["ru", "uz", "en"]:
+            from sqlalchemy import or_
+            query = query.filter(or_(Subject.lang == effective_lang, Subject.lang == "all", Subject.lang == None))
+
+        subjects = query.all()
         result = []
         for s in subjects:
             total = db.query(Question).filter(Question.subject_id == s.id).count()
@@ -389,13 +428,25 @@ class SubmitResultRequest(BaseModel):
     answers: dict
 
 
+class SubmitResultRequestV2(BaseModel):
+    subject_id: int
+    answers: dict
+    time_spent: Optional[int] = None  # секунд потрачено
+
+
 @app.post("/results")
 def submit_result(payload: SubmitResultRequest, db: Session = Depends(get_db), user: User = Depends(require_subscription)):
     questions = db.query(Question).filter(Question.subject_id == payload.subject_id).all()
-    score = sum(1 for q in questions if payload.answers.get(str(q.id)) is not None and int(payload.answers[str(q.id)]) == q.correct_option_id)
+    if not questions:
+        raise HTTPException(status_code=404, detail="Предмет не найден или нет вопросов")
+    score = sum(
+        1 for q in questions
+        if payload.answers.get(str(q.id)) is not None
+        and int(payload.answers[str(q.id)]) == q.correct_option_id
+    )
     db.add(Result(user_id=user.id, subject_id=payload.subject_id, score=score, total=len(questions)))
     db.commit()
-    new_achievements = check_and_award(user.id, db)
+    new_achievements = check_and_award(user.id, db, lang=getattr(user, "lang", "ru") or "ru")
     return {
         "score": score,
         "total": len(questions),
@@ -510,13 +561,21 @@ class AddQuestionRequest(BaseModel):
 def add_question(payload: AddQuestionRequest, db: Session = Depends(get_db), user: User = Depends(require_teacher)):
     if len(payload.options) < 2:
         raise HTTPException(status_code=400, detail="Нужно минимум 2 варианта")
-    q = Question(subject_id=payload.subject_id, text=payload.text, image_url=payload.image_url, correct_option_id=payload.correct_index)
+    if payload.correct_index < 0 or payload.correct_index >= len(payload.options):
+        raise HTTPException(status_code=400, detail="correct_index выходит за пределы списка вариантов")
+    q = Question(subject_id=payload.subject_id, text=payload.text, image_url=payload.image_url, correct_option_id=0)
     db.add(q); db.flush()
+    correct_opt_id = None
     for i, opt in enumerate(payload.options):
         if isinstance(opt, str):
-            db.add(Option(question_id=q.id, text=opt, order_index=i))
+            opt_obj = Option(question_id=q.id, text=opt, order_index=i)
         else:
-            db.add(Option(question_id=q.id, text=opt.text, image_url=opt.image_url, order_index=i))
+            opt_obj = Option(question_id=q.id, text=opt.text, image_url=opt.image_url, order_index=i)
+        db.add(opt_obj)
+        db.flush()
+        if i == payload.correct_index:
+            correct_opt_id = opt_obj.id
+    q.correct_option_id = correct_opt_id
     db.commit()
     return {"id": q.id, "message": "Вопрос добавлен ✅"}
 
@@ -599,16 +658,25 @@ async def import_questions(
                 errors.append(f"Строка {row_num}: правильный ответ '{correct_letter}' — варианта нет")
                 continue
 
+            # Создаём вопрос (correct_option_id обновим после вставки вариантов)
             q = Question(
                 subject_id=subject_id,
                 text=q_text,
-                correct_option_id=correct_index
+                correct_option_id=0  # временно
             )
             db.add(q)
             db.flush()
 
+            correct_opt_db_id = None
             for i, opt_text in enumerate(options):
-                db.add(Option(question_id=q.id, text=opt_text, order_index=i))
+                opt_obj = Option(question_id=q.id, text=opt_text, order_index=i)
+                db.add(opt_obj)
+                db.flush()
+                if i == correct_index:
+                    correct_opt_db_id = opt_obj.id
+
+            # Сохраняем реальный id правильного варианта
+            q.correct_option_id = correct_opt_db_id
 
             added += 1
 
@@ -658,16 +726,24 @@ def edit_question(question_id: int, payload: AddQuestionRequest, db: Session = D
     q = db.query(Question).filter(Question.id == question_id).first()
     if not q:
         raise HTTPException(status_code=404, detail="Вопрос не найден")
+    if payload.correct_index < 0 or payload.correct_index >= len(payload.options):
+        raise HTTPException(status_code=400, detail="correct_index выходит за пределы списка вариантов")
     q.text = payload.text
-    q.correct_option_id = payload.correct_index
     if payload.image_url is not None:
         q.image_url = payload.image_url
     db.query(Option).filter(Option.question_id == question_id).delete()
+    db.flush()
+    correct_opt_id = None
     for i, opt in enumerate(payload.options):
         if isinstance(opt, str):
-            db.add(Option(question_id=q.id, text=opt, order_index=i))
+            opt_obj = Option(question_id=q.id, text=opt, order_index=i)
         else:
-            db.add(Option(question_id=q.id, text=opt.text, image_url=getattr(opt, 'image_url', None), order_index=i))
+            opt_obj = Option(question_id=q.id, text=opt.text, image_url=getattr(opt, 'image_url', None), order_index=i)
+        db.add(opt_obj)
+        db.flush()
+        if i == payload.correct_index:
+            correct_opt_id = opt_obj.id
+    q.correct_option_id = correct_opt_id
     db.commit()
     return {"message": "Вопрос обновлён ✅"}
 
@@ -761,28 +837,72 @@ def set_role(user_id: int, role: str, db: Session = Depends(get_db), user: User 
 # ── ДОСТИЖЕНИЯ ────────────────────────────────────────────────────────────
 
 ACHIEVEMENTS = {
-    "first_test":   {"id": "first_test",   "title": "Первый шаг",    "desc": "Сдал первый тест",             "emoji": "🎯"},
-    "perfect":      {"id": "perfect",      "title": "Отличник",      "desc": "100% правильных ответов",      "emoji": "💯"},
-    "streak_3":     {"id": "streak_3",     "title": "На волне",      "desc": "3 теста подряд выше 80%",      "emoji": "🔥"},
-    "speed_run":    {"id": "speed_run",    "title": "Молния",        "desc": "Закончил тест за 50% времени", "emoji": "⚡"},
-    "all_subjects": {"id": "all_subjects", "title": "Всезнайка",     "desc": "Прошёл все предметы",          "emoji": "🏆"},
-    "duel_win":     {"id": "duel_win",     "title": "Победитель",    "desc": "Выиграл дуэль",                "emoji": "⚔️"},
-    "duel_3":       {"id": "duel_3",       "title": "Дуэлянт",       "desc": "Выиграл 3 дуэли",              "emoji": "🥊"},
+    "first_test": {
+        "id": "first_test", "emoji": "🎯",
+        "title": {"ru": "Первый шаг",  "uz": "Birinchi qadam", "en": "First Step"},
+        "desc":  {"ru": "Сдал первый тест", "uz": "Birinchi testni topshirdi", "en": "Passed the first test"},
+    },
+    "perfect": {
+        "id": "perfect", "emoji": "💯",
+        "title": {"ru": "Отличник",    "uz": "A'lochi",        "en": "Perfectionist"},
+        "desc":  {"ru": "100% правильных ответов", "uz": "100% to'g'ri javoblar", "en": "100% correct answers"},
+    },
+    "streak_3": {
+        "id": "streak_3", "emoji": "🔥",
+        "title": {"ru": "На волне",    "uz": "Zo'r ketish",    "en": "On a Roll"},
+        "desc":  {"ru": "3 теста подряд выше 80%", "uz": "Ketma-ket 3 test 80% dan yuqori", "en": "3 tests in a row above 80%"},
+    },
+    "speed_run": {
+        "id": "speed_run", "emoji": "⚡",
+        "title": {"ru": "Молния",      "uz": "Chaqmoq",        "en": "Lightning"},
+        "desc":  {"ru": "Закончил тест за 50% времени", "uz": "Testni vaqtning 50% ida tugatdi", "en": "Finished test in 50% of time"},
+    },
+    "all_subjects": {
+        "id": "all_subjects", "emoji": "🏆",
+        "title": {"ru": "Всезнайка",   "uz": "Hammachidon",    "en": "Know-it-all"},
+        "desc":  {"ru": "Прошёл все предметы", "uz": "Barcha fanlarni o'tdi", "en": "Completed all subjects"},
+    },
+    "duel_win": {
+        "id": "duel_win", "emoji": "⚔️",
+        "title": {"ru": "Победитель",  "uz": "G'olib",         "en": "Champion"},
+        "desc":  {"ru": "Выиграл дуэль", "uz": "Dueldа g'alaba qozondi", "en": "Won a duel"},
+    },
+    "duel_3": {
+        "id": "duel_3", "emoji": "🥊",
+        "title": {"ru": "Дуэлянт",     "uz": "Duelchi",        "en": "Duelist"},
+        "desc":  {"ru": "Выиграл 3 дуэли", "uz": "3 ta duelda g'alaba", "en": "Won 3 duels"},
+    },
 }
+
+
+def localize_achievement(ach: dict, lang: str) -> dict:
+    """Возвращает достижение с title/desc на нужном языке."""
+    l = lang if lang in ["ru", "uz", "en"] else "ru"
+    return {
+        "id": ach["id"],
+        "emoji": ach["emoji"],
+        "title": ach["title"][l],
+        "desc": ach["desc"][l],
+    }
 
 
 @app.get("/my-achievements")
 def get_my_achievements(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     earned = db.query(UserAchievement).filter(UserAchievement.user_id == user.id).all()
     earned_ids = {a.achievement_id for a in earned}
+    lang = getattr(user, "lang", "ru") or "ru"
     result = []
     for ach_id, ach in ACHIEVEMENTS.items():
-        result.append({**ach, "earned": ach_id in earned_ids,
-                       "earned_at": next((a.earned_at.isoformat() for a in earned if a.achievement_id == ach_id), None)})
+        localized = localize_achievement(ach, lang)
+        result.append({
+            **localized,
+            "earned": ach_id in earned_ids,
+            "earned_at": next((a.earned_at.isoformat() for a in earned if a.achievement_id == ach_id), None)
+        })
     return result
 
 
-def check_and_award(user_id: int, db: Session, extra: dict = {}):
+def check_and_award(user_id: int, db: Session, extra: dict = {}, lang: str = "ru"):
     results = db.query(Result).filter(Result.user_id == user_id).all()
     earned = {a.achievement_id for a in db.query(UserAchievement).filter(UserAchievement.user_id == user_id).all()}
     new_achievements = []
@@ -790,7 +910,7 @@ def check_and_award(user_id: int, db: Session, extra: dict = {}):
     def award(ach_id):
         if ach_id not in earned:
             db.add(UserAchievement(user_id=user_id, achievement_id=ach_id))
-            new_achievements.append(ACHIEVEMENTS[ach_id])
+            new_achievements.append(localize_achievement(ACHIEVEMENTS[ach_id], lang))
             earned.add(ach_id)
 
     if len(results) >= 1: award("first_test")
@@ -901,8 +1021,10 @@ def submit_duel(duel_id: int, answers: dict, db: Session = Depends(get_db), user
             duel.winner_id = duel.challenger_id
         elif duel.opponent_score > duel.challenger_score:
             duel.winner_id = duel.opponent_id
-        check_and_award(duel.challenger_id, db)
-        check_and_award(duel.opponent_id, db)
+        challenger = db.query(User).filter(User.id == duel.challenger_id).first()
+        opponent = db.query(User).filter(User.id == duel.opponent_id).first()
+        check_and_award(duel.challenger_id, db, lang=getattr(challenger, "lang", "ru") or "ru")
+        check_and_award(duel.opponent_id, db, lang=getattr(opponent, "lang", "ru") or "ru")
 
     db.commit()
     return {"score": score, "total": len(questions), "finished": duel.challenger_finished and duel.opponent_finished,

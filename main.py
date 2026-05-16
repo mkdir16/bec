@@ -91,7 +91,6 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:5173",
         "http://127.0.0.1:3000",
-        "https://fron-git-devin-1778646551-2edf08-zuravleveduard1-9669s-projects.vercel.app",
         "http://127.0.0.1:5173",
     ],
     allow_credentials=True,
@@ -535,13 +534,32 @@ def my_results(db: Session = Depends(get_db), user: User = Depends(get_current_u
 
 # ── АДМИН: ПРЕДМЕТЫ ──────────────────────────────────────────────────────
 
+class CreateSubjectRequest(BaseModel):
+    title: str
+    emoji: str = "📚"
+    time_limit: int = 60
+    question_count: int = 30
+    lang: str = "all"
+
+
 @app.post("/admin/subjects")
-def create_subject(title: str, emoji: str = "📚", time_limit: int = 60, question_count: int = 30, lang: str = "all", db: Session = Depends(get_db), user: User = Depends(require_teacher)):
-    if lang not in ["all", "ru", "uz", "en"]:
+def create_subject(
+    payload: CreateSubjectRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_teacher)
+):
+    if payload.lang not in ["all", "ru", "uz", "en"]:
         raise HTTPException(status_code=400, detail="lang: all, ru, uz, en")
-    s = Subject(title=title, emoji=emoji, time_limit=time_limit, question_count=question_count, lang=lang)
+    s = Subject(
+        title=payload.title,
+        emoji=payload.emoji,
+        time_limit=payload.time_limit,
+        question_count=payload.question_count,
+        lang=payload.lang
+    )
     db.add(s); db.commit(); db.refresh(s)
-    return {"id": s.id, "title": s.title, "time_limit": s.time_limit, "question_count": s.question_count, "lang": s.lang}
+    return {"id": s.id, "title": s.title, "emoji": s.emoji,
+            "time_limit": s.time_limit, "question_count": s.question_count, "lang": s.lang}
 
 
 # ── АДМИН: ВОПРОСЫ ───────────────────────────────────────────────────────

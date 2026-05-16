@@ -605,117 +605,119 @@ async def import_questions(
 ):
     import openpyxl
     import tempfile
-    import os
+
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="Только Excel файлы (.xlsx)")
 
     subject = db.query(Subject).filter(Subject.id == subject_id).first()
     if not subject:
         raise HTTPException(status_code=404, detail="Предмет не найден")
 
-    fname = (file.filename or "").lower()
-    suffix = ".xlsx" if fname.endswith(".xlsx") else ".xls" if fname.endswith(".xls") else ".xlsx"
+    content = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
 
-    file_content = await file.read()
-    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(file_content)
-            tmp_path = tmp.name
-
-        wb = openpyxl.load_workbook(tmp_path, data_only=True)
+        wb = openpyxl.load_workbook(tmp_path)
         ws = wb.active
 
-        # ── Определяем строку заголовка и первую строку данных ──────────────
-        # Ищем строку, где первая ячейка похожа на "вопрос" или содержит текст,
-        # а следующая — на вариант ответа. Пропускаем шапки любой высоты.
-        HEADER_KEYWORDS = {"вопрос", "question", "savol", "текст"}
-        data_start_row = 2  # fallback: пропускаем только первую строку
-
-        all_rows = list(ws.iter_rows(values_only=True))
-        for i, row in enumerate(all_rows[:10]):  # ищем в первых 10 строках
-            cell0 = str(row[0] or "").strip().lower()
-            # Если первая ячейка — заголовок, данные начинаются со следующей строки
-            if any(kw in cell0 for kw in HEADER_KEYWORDS):
-                data_start_row = i + 2  # +1 индекс, +1 следующая строка
-                break
-            # Если первая ячейка выглядит как реальный вопрос (длиннее 10 символов) — данные уже здесь
-            if len(cell0) > 10 and not cell0.startswith("⚠"):
-                data_start_row = i + 1
-                break
-
-        letter_to_index = {
-            "A": 0, "Б": 1, "В": 2, "Г": 3, "Д": 4,
-            "B": 1, "C": 2, "D": 3, "E": 4,  # латинские тоже
-        }
         added = 0
         errors = []
+        all_rows = list(ws.iter_rows(min_row=1, values_only=True))
 
-        for row_num, row in enumerate(
-            ws.iter_rows(min_row=data_start_row, values_only=True),
-            start=data_start_row
-        ):
-            # Безопасно получаем значение ячейки по индексу
-            def cell(idx):
-                if idx < len(row) and row[idx] is not None:
-                    return str(row[idx]).strip()
-                return ""
+        # ── Автоопределение формата ──────────────────────────────────────────
+        # Формат VERTICAL (напр. БЖД):
+        #   вопрос: col0=текст, col1=номер_правильного (1-based число)
+        #   варианты: следующие строки col0=текст, col1=None
+        # Формат HORIZONTAL (стандартный шаблон UniQuiz):
+        #   col0=вопрос, col1=вар.A, col2=вар.B, ..., col6=правильный(A/Б/1/2)
 
-            q_text       = cell(0)
-            opt_a        = cell(1)
-            opt_b        = cell(2)
-            opt_c        = cell(3)
-            opt_d        = cell(4)
-            opt_e        = cell(5)
-            correct_raw  = cell(6).upper() if len(row) > 6 else ""
+        def is_vertical(rows):
+            score = 0; total = 0
+            for r in rows[1:20]:
+                if not r[0]: continue
+                total += 1
+                if r[1] is None or (isinstance(r[1], (int, float)) and 1 <= r[1] <= 10):
+                    score += 1
+            return total > 0 and score / total >= 0.6
 
-            # Пропускаем пустые строки и служебные строки
-            if not q_text or q_text.startswith("⚠") or q_text.lower().startswith("вопрос"):
-                continue
-            if not opt_a or not opt_b:
-                errors.append(f"Строка {row_num}: нужно минимум 2 варианта")
-                continue
+        fmt = 'vertical' if is_vertical(all_rows) else 'horizontal'
 
-            # correct_raw может быть "A", "Б", "1", "A." и т.д. — чистим
-            correct_letter = correct_raw.strip(".) ").upper()
-            # Поддержка: "1"→A, "2"→Б и т.д.
-            digit_map = {"1": "A", "2": "Б", "3": "В", "4": "Г", "5": "Д"}
-            if correct_letter in digit_map:
-                correct_letter = digit_map[correct_letter]
+        if fmt == 'vertical':
+            # ── Вертикальный формат ──────────────────────────────────────────
+            i = 1 if (all_rows and all_rows[0][0] and not isinstance(all_rows[0][1], (int, float))) else 0
+            while i < len(all_rows):
+                row = all_rows[i]
+                if row[0] and isinstance(row[1], (int, float)):
+                    q_text = str(row[0]).strip()
+                    correct_1based = int(row[1])
+                    options = []
+                    j = i + 1
+                    while j < len(all_rows):
+                        r2 = all_rows[j]
+                        if r2[0] and r2[1] is None:
+                            t = str(r2[0]).strip()
+                            if t: options.append(t)
+                            j += 1
+                        else:
+                            break
+                    if len(options) < 2:
+                        errors.append(f"Строка {i+1}: менее 2 вариантов")
+                        i = j; continue
+                    correct_index = max(0, min(correct_1based - 1, len(options) - 1))
+                    q = Question(subject_id=subject_id, text=q_text, correct_option_id=0)
+                    db.add(q); db.flush()
+                    correct_opt_db_id = None
+                    for k, opt_text in enumerate(options):
+                        opt_obj = Option(question_id=q.id, text=opt_text, order_index=k)
+                        db.add(opt_obj); db.flush()
+                        if k == correct_index: correct_opt_db_id = opt_obj.id
+                    q.correct_option_id = correct_opt_db_id
+                    added += 1; i = j
+                else:
+                    i += 1
 
-            if correct_letter not in letter_to_index:
-                errors.append(
-                    f"Строка {row_num}: неверный правильный ответ '{correct_raw}' "
-                    f"(нужно A/Б/В/Г/Д или 1/2/3/4/5)"
-                )
-                continue
+        else:
+            # ── Горизонтальный формат ────────────────────────────────────────
+            letter_to_index = {"A":0,"Б":1,"В":2,"Г":3,"Д":4,"B":1,"C":2,"D":3,"E":4}
+            digit_map = {"1":"A","2":"Б","3":"В","4":"Г","5":"Д"}
+            data_start = 1
+            for idx, row in enumerate(all_rows[:10]):
+                c0 = str(row[0] or "").strip().lower()
+                if any(kw in c0 for kw in ("вопрос","question","savol")):
+                    data_start = idx + 1; break
+                if len(c0) > 10 and not c0.startswith("⚠"):
+                    data_start = idx; break
 
-            options = [opt_a, opt_b]
-            if opt_c: options.append(opt_c)
-            if opt_d: options.append(opt_d)
-            if opt_e: options.append(opt_e)
-
-            correct_index = letter_to_index[correct_letter]
-            if correct_index >= len(options):
-                errors.append(
-                    f"Строка {row_num}: правильный ответ '{correct_letter}' "
-                    f"— нет варианта с таким индексом"
-                )
-                continue
-
-            q = Question(subject_id=subject_id, text=q_text, correct_option_id=0)
-            db.add(q)
-            db.flush()
-
-            correct_opt_db_id = None
-            for i, opt_text in enumerate(options):
-                opt_obj = Option(question_id=q.id, text=opt_text, order_index=i)
-                db.add(opt_obj)
-                db.flush()
-                if i == correct_index:
-                    correct_opt_db_id = opt_obj.id
-
-            q.correct_option_id = correct_opt_db_id
-
-            added += 1
+            for row_num, row in enumerate(all_rows[data_start:], start=data_start+1):
+                def cell(idx, r=row):
+                    return str(r[idx]).strip() if idx < len(r) and r[idx] is not None else ""
+                q_text = cell(0)
+                if not q_text or q_text.startswith("⚠"): continue
+                opt_a=cell(1); opt_b=cell(2); opt_c=cell(3); opt_d=cell(4); opt_e=cell(5)
+                correct_raw = cell(6).upper()
+                if not opt_a or not opt_b:
+                    errors.append(f"Строка {row_num}: нужно минимум 2 варианта"); continue
+                cl = correct_raw.strip(".) ")
+                if cl in digit_map: cl = digit_map[cl]
+                if cl not in letter_to_index:
+                    errors.append(f"Строка {row_num}: неверный ответ '{correct_raw}'"); continue
+                options = [opt_a, opt_b]
+                for o in [opt_c, opt_d, opt_e]:
+                    if o: options.append(o)
+                correct_index = letter_to_index[cl]
+                if correct_index >= len(options):
+                    errors.append(f"Строка {row_num}: ответ вне диапазона"); continue
+                q = Question(subject_id=subject_id, text=q_text, correct_option_id=0)
+                db.add(q); db.flush()
+                correct_opt_db_id = None
+                for i, opt_text in enumerate(options):
+                    opt_obj = Option(question_id=q.id, text=opt_text, order_index=i)
+                    db.add(opt_obj); db.flush()
+                    if i == correct_index: correct_opt_db_id = opt_obj.id
+                q.correct_option_id = correct_opt_db_id
+                added += 1
 
         db.commit()
 
